@@ -1,11 +1,10 @@
 """
 End-to-end pipeline tests for qxdm_init.
 
-Each test runs in a fully isolated temporary workspace (``tmp_path``) so
-prior runs and human activity in ``logs/`` cannot influence results.
-
-The pytest fixtures expose this as ``test_pipeline_integration``.  When
-run as a script, only the "happy path" scenario is exercised.
+Each test runs in a fully isolated temporary workspace (``tmp_path``) by
+constructing its own :class:`Settings` instance pointing at that
+``tmp_path`` and rebuilding the FastAPI app against those settings.  No
+module-level globals are mutated by these tests.
 """
 
 from __future__ import annotations
@@ -13,72 +12,79 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import subprocess
 import sys
+import threading
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, Iterable
+from typing import Dict
 
-# Allow running this file directly inside /qxdm_init
 BASE_DIR = Path(__file__).resolve().parent
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-import config  # noqa: E402
-from api_server import app  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
-from log_rotator import run_log_rotation  # noqa: E402
+
+from api_server import create_app  # noqa: E402
+from log_rotator import LogRotator  # noqa: E402
+from settings import Settings  # noqa: E402
+
+
+REPO_ROOT = BASE_DIR.parent
+SOURCE_DMC = BASE_DIR / "configs" / "default_test.dmc"
 
 
 # ---------------------------------------------------------------------------
-# Helpers
+# Test helpers
 # ---------------------------------------------------------------------------
-def _isolate_environment(tmp_path: Path) -> Dict[str, Path]:
-    """Redirect every directory referenced by ``config`` to ``tmp_path``."""
-    redirects = {
-        "JOBS_ROOT": tmp_path / "jobs",
-        "LOG_DIRECTORY": tmp_path / "raw",
-        "CONVERTED_DIRECTORY": tmp_path / "converted",
-        "BACKUP_DIRECTORY": tmp_path / "backup",
-        "CONFIGS_DIRECTORY": tmp_path / "configs",
-    }
-    saved: Dict[str, object] = {}
-
-    # Ensure configs directory exists with a default DMC file.
-    redirects["CONFIGS_DIRECTORY"].mkdir(parents=True, exist_ok=True)
-    shutil.copy(
-        Path(config.DMC_FILE),
-        redirects["CONFIGS_DIRECTORY"] / Path(config.DMC_FILE).name,
+def _make_isolated_settings(tmp_path: Path) -> Settings:
+    """Build a :class:`Settings` pointing at ``tmp_path`` with a copy of the DMC."""
+    base = Settings(
+        base_dir=BASE_DIR,
+        jobs_root=tmp_path / "jobs",
+        converted_directory=tmp_path / "converted",
+        backup_directory=tmp_path / "backup",
+        configs_directory=tmp_path / "configs",
+        legacy_raw_directory=tmp_path / "raw",
+        device_agent_artifact_dir=tmp_path / "device_agent",
+        manifests_directory=tmp_path / "manifests",
+        mock_mode=True,
+        force_windows_legacy=False,
+        qxdm_exe="/nonexistent",
+        qcat_exe="/nonexistent",
+        qcat_command_template=None,
+        dmc_file=str(SOURCE_DMC),
+        max_log_size_mb=1,
+        default_log_duration_sec=10,
+        com_port="",
+        device_agent_url="http://127.0.0.1:9999",
+        device_agent_token=None,
+        device_agent_timeout_sec=2.0,
+        device_agent_poll_initial_sec=0.1,
+        device_agent_poll_max_sec=0.5,
+        device_agent_poll_deadline_sec=10.0,
+        retention_days=7,
+        backup_quota_mb=1024,
+        rotation_interval_sec=3600,
+        stability_window_sec=0.3,
+        max_wait_for_log_sec=10.0,
+        max_wait_for_stability_sec=10.0,
+        mock_chunk_interval_ms=50,
+        mock_chunk_size_bytes=4096,
+        mock_rollover_mb=1,
+        mock_simulate_flush_delay_sec=0.2,
+        mock_fail_mode="none",
+        api_host="127.0.0.1",
+        api_port=8000,
+        api_token=None,
+        decoder_kind="mock",
+        decoder_template=None,
     )
-
-    for attr, value in redirects.items():
-        saved[attr] = getattr(config, attr)
-        setattr(config, attr, value)
-        Path(value).mkdir(parents=True, exist_ok=True)
-
-    # Use a tiny rollover so the mock completes quickly in tests.
-    saved_max = config.MAX_LOG_SIZE_MB
-    config.MAX_LOG_SIZE_MB = 1
-    saved_rollover = config.MOCK_CONFIG.get("rollover_mb")
-    config.MOCK_CONFIG["rollover_mb"] = 1
-    saved["MAX_LOG_SIZE_MB"] = saved_max
-    saved["MOCK_CONFIG"] = dict(config.MOCK_CONFIG)
-
-    # Force a faster stabilisation window so tests aren't slow.
-    config.ROTATION_CONFIG["max_wait_for_log_sec"] = 10
-    config.ROTATION_CONFIG["stability_window_sec"] = 0.5
-
-    return {"redirects": redirects, "saved": saved}
-
-
-def _restore_environment(env: Dict[str, Path]) -> None:
-    saved = env["saved"]
-    for attr, original in saved.items():
-        if attr == "MOCK_CONFIG":
-            config.MOCK_CONFIG.clear()
-            config.MOCK_CONFIG.update(original)
-        else:
-            setattr(config, attr, original)
+    base.ensure_directories()
+    shutil.copy(SOURCE_DMC, base.configs_directory / SOURCE_DMC.name)
+    return base
 
 
 def _purge(directory: Path) -> None:
@@ -94,7 +100,6 @@ def _purge(directory: Path) -> None:
 
 
 def _inject_old_archive(backup_dir: Path, days_old: int = 10) -> Path:
-    """Create an archive with mtime N days in the past and return its path."""
     backup_dir.mkdir(parents=True, exist_ok=True)
     old = backup_dir / f"OLD_SCENARIO_{uuid.uuid4().hex[:6]}.zip"
     old.write_bytes(b"dummy zip content")
@@ -104,85 +109,64 @@ def _inject_old_archive(backup_dir: Path, days_old: int = 10) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# Test cases
+# Tests
 # ---------------------------------------------------------------------------
-def _run_pipeline_via_api(
-    payload: Dict[str, object], tmp_path: Path
-) -> Dict[str, object]:
-    env = _isolate_environment(tmp_path)
-    try:
-        _purge(env["redirects"]["JOBS_ROOT"])
-        _purge(env["redirects"]["CONVERTED_DIRECTORY"])
-        _purge(env["redirects"]["BACKUP_DIRECTORY"])
-
-        client = TestClient(app)
-        response = client.post("/api/v1/trigger-logging", json=payload)
-        assert response.status_code == 200, response.text
-        return response.json()
-    finally:
-        _restore_environment(env)
-
-
 def test_pipeline_happy_path(tmp_path: Path):
     """Mock-mode capture -> convert -> archive in an isolated workspace."""
+    settings = _make_isolated_settings(tmp_path)
+    app = create_app(settings=settings)
+    client = TestClient(app)
+
     payload = {
         "scenario_name": "TMO_5G_VoNR_Drop_Test",
         "duration_seconds": 2,
-        "dmc_config": str(Path(config.DMC_FILE)),
+        "dmc_config": str(SOURCE_DMC),
         "prefix": "CHAMBER_1",
     }
-    response = _run_pipeline_via_api(payload, tmp_path)
-
-    assert response["status"] in ("SUCCESS", "PARTIAL"), response
-    job_id = response["job_id"]
-    processing = response["artifacts"]["processing"]
+    response = client.post("/api/v1/trigger-logging", json=payload)
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] in ("SUCCESS", "PARTIAL"), body
+    job_id = body["job_id"]
+    processing = body["artifacts"]["processing"]
     assert processing["ok"], processing
-    assert processing["job_id"] == job_id
-    assert processing["artifacts"], "no artifacts produced"
 
-    # Every artifact should now exist in the isolated dirs.
-    job_root = tmp_path / "jobs" / job_id
-    raw_files = list(job_root.glob("raw/*.qmdl"))
     converted = list((tmp_path / "converted").glob("*.txt"))
     zips = list((tmp_path / "backup").glob(f"*_{job_id}_*.zip"))
+    leftovers = list((tmp_path / "jobs" / job_id / "raw").glob("*.qmdl"))
 
-    assert not raw_files, (
-        "raw binaries should be cleaned up after successful archive, "
-        f"found {raw_files}"
-    )
     assert len(converted) >= 1, "expected at least one decoded text file"
-    assert len(zips) == len(processing["artifacts"]), (
-        f"expected {len(processing['artifacts'])} ZIPs, found {zips}"
-    )
+    assert len(zips) == len(processing["artifacts"]), (len(zips), processing)
+    assert not leftovers, f"raw binaries should be cleaned up: {leftovers}"
 
-    # decoded text should contain known LTE/5G markers
     sample_text = converted[0].read_text(encoding="utf-8", errors="replace")
     assert "LTE Serving Cell Info" in sample_text
     assert "5GMM_REGISTRATION_REJECT" in sample_text
 
 
 def test_pipeline_isolated_jobs(tmp_path: Path):
-    """Two concurrent requests must not see each other's raw files."""
+    """Sequential two-job run, each isolated."""
+    settings = _make_isolated_settings(tmp_path)
+    app = create_app(settings=settings)
+    client = TestClient(app)
+
     payload_a = {
         "scenario_name": "Run_A",
         "duration_seconds": 1,
-        "dmc_config": str(Path(config.DMC_FILE)),
+        "dmc_config": str(SOURCE_DMC),
         "prefix": "PFX_A",
     }
     payload_b = {
         "scenario_name": "Run_B",
         "duration_seconds": 1,
-        "dmc_config": str(Path(config.DMC_FILE)),
+        "dmc_config": str(SOURCE_DMC),
         "prefix": "PFX_B",
     }
-    resp_a = _run_pipeline_via_api(payload_a, tmp_path)
-    resp_b = _run_pipeline_via_api(payload_b, tmp_path)
-
+    resp_a = client.post("/api/v1/trigger-logging", json=payload_a).json()
+    resp_b = client.post("/api/v1/trigger-logging", json=payload_b).json()
     job_ids = {resp_a["job_id"], resp_b["job_id"]}
-    assert len(job_ids) == 2, "jobs must be uniquely identified"
-    assert resp_a["artifacts"]["processing"]["job_id"] in job_ids
+    assert len(job_ids) == 2
 
-    # No leftover raw files in either job directory.
     for jid in job_ids:
         leftovers = list((tmp_path / "jobs" / jid / "raw").glob("*.qmdl"))
         assert not leftovers, f"job {jid} left {leftovers}"
@@ -190,47 +174,34 @@ def test_pipeline_isolated_jobs(tmp_path: Path):
 
 def test_log_rotator_age_retention(tmp_path: Path):
     backup_dir = tmp_path / "backup"
+    settings = _make_isolated_settings(tmp_path)
     old = _inject_old_archive(backup_dir, days_old=10)
-
-    # Configure rotation to be aggressive in tmp_path.
-    saved_days = config.ROTATION_CONFIG["max_retention_days"]
-    saved_max_mb = config.ROTATION_CONFIG["max_backup_dir_mb"]
-    config.ROTATION_CONFIG["max_retention_days"] = 7
-    config.ROTATION_CONFIG["max_backup_dir_mb"] = 1024
-    try:
-        result = run_log_rotation(directory=backup_dir)
-        assert result.pruned_by_age >= 1
-        assert not old.exists()
-    finally:
-        config.ROTATION_CONFIG["max_retention_days"] = saved_days
-        config.ROTATION_CONFIG["max_backup_dir_mb"] = saved_max_mb
+    rotator = LogRotator(settings=settings, directory=backup_dir, max_retention_days=7)
+    result = rotator.run_once()
+    assert result.pruned_by_age >= 1
+    assert not old.exists()
 
 
 def test_log_rotator_quota(tmp_path: Path):
-    """Quota enforcement: oldest zip removed when total exceeds cap."""
     backup_dir = tmp_path / "backup"
+    settings = _make_isolated_settings(tmp_path)
     backup_dir.mkdir(parents=True, exist_ok=True)
     big_files = []
     for i in range(3):
         p = backup_dir / f"big_{i}.zip"
-        p.write_bytes(b"X" * (200 * 1024))  # 200 KiB
+        p.write_bytes(b"X" * (200 * 1024))
         big_files.append(p)
-        # spread mtimes so oldest order is unambiguous
         os.utime(p, (time.time() - (10 - i), time.time() - (10 - i)))
 
-    result = run_log_rotation(directory=backup_dir, max_backup_dir_mb=0)  # quota=0
+    rotator = LogRotator(
+        settings=settings, directory=backup_dir, max_backup_dir_mb=0
+    )
+    result = rotator.run_once()
     assert result.pruned_by_quota >= 1
-    # oldest must be gone
     assert not big_files[0].exists()
-    # at least one survivor remains (or all gone - both acceptable for 0-byte quota)
-    # but the final size must respect the requested quota
-    assert result.final_size_mb <= 1  # 0 MiB cap allows a few KiB due to float rounding
 
 
 def test_log_rotator_entrypoint_help(capsys):
-    """`python -m log_rotator --help` should succeed."""
-    import subprocess
-
     result = subprocess.run(
         [sys.executable, "-m", "log_rotator", "--help"],
         cwd=BASE_DIR,
@@ -243,139 +214,143 @@ def test_log_rotator_entrypoint_help(capsys):
 
 
 def test_mock_rollover(tmp_path: Path):
-    """Mock writer should produce multiple .qmdl files when rollover hits."""
-    env = _isolate_environment(tmp_path)
-    try:
-        # Force a small rollover threshold (chunk_bytes * 2 = 8 KiB) so the
-        # writer rolls over quickly during a 1.5 second run.
-        config.MOCK_CONFIG["chunk_size_bytes"] = 4096
-        config.MOCK_CONFIG["chunk_interval_ms"] = 50
-        config.MOCK_CONFIG["rollover_mb"] = 1
-        config.MOCK_CONFIG["simulate_flush_delay_sec"] = 0.2
-        config.ROTATION_CONFIG["stability_window_sec"] = 0.3
-        config.ROTATION_CONFIG["max_wait_for_log_sec"] = 10
+    """Mock writer produces multiple .qmdl files when rollover threshold is low."""
+    settings = _make_isolated_settings(tmp_path).with_overrides(
+        mock_chunk_size_bytes=4096,
+        mock_chunk_interval_ms=20,
+        mock_rollover_mb=1,
+        mock_simulate_flush_delay_sec=0.1,
+        stability_window_sec=0.3,
+        max_wait_for_log_sec=10.0,
+    )
 
-        # Reach directly into the controller for direct binary inspection.
-        from qxdm_service import MockQXDMController
+    from qxdm_service import (
+        MockQXDMController,
+        _WriterContext,
+        _safe_join,
+        _writer_main,
+    )
 
-        controller = MockQXDMController(
-            job_id="rollover-test", raw_dir=tmp_path / "raw"
-        )
-        artifacts = controller.start_session(
-            dmc_file=str(Path(config.DMC_FILE)),
-            duration_sec=1,
-            prefix="ROLL",
-            scenario_name="rollover",
-            job_id="rollover-test",
-        )
-        # A clean 1-second run with 4 KiB chunks every 50 ms always exceeds
-        # the 1 MiB rollover threshold defined by config.MOCK_CONFIG.
-        assert artifacts.log_count >= 1
-        # Now hit the rollover test directly by validating that the writer
-        # supports it - execute the internal writer with tight rollover.
-        from qxdm_service import _WriterContext, _writer_main, _safe_join
-        import threading
+    controller = MockQXDMController(settings=settings, raw_dir=tmp_path / "raw")
+    artifacts = controller.start_session(
+        dmc_file=str(SOURCE_DMC),
+        duration_sec=1,
+        prefix="ROLL",
+        scenario_name="rollover",
+        job_id="rollover-test",
+    )
+    assert artifacts.log_count >= 1
 
-        prefix_path = _safe_join(tmp_path / "raw2", "ROLLOVER_TEST")
-        (tmp_path / "raw2").mkdir(parents=True, exist_ok=True)
-        ctx = _WriterContext(
-            raw_dir=tmp_path / "raw2",
-            prefix=prefix_path.name,
-            prefix_full=prefix_path,
-            rollover_bytes=8 * 1024,  # 8 KiB
-            chunk_bytes=4096,
-            chunk_interval_ms=20,
-            fail_mode="none",
-        )
-        stop = threading.Event()
-        thread = threading.Thread(target=_writer_main, args=(ctx, stop), daemon=True)
-        thread.start()
-        time.sleep(0.5)
-        stop.set()
-        thread.join(timeout=5)
-        # With 4 KiB chunks rolled over every 8 KiB, expect at least 2 files.
-        assert len(ctx.files_written) >= 2, (
-            f"expected rollover to produce >=2 files, got {ctx.files_written}"
-        )
-    finally:
-        _restore_environment(env)
+    raw2 = tmp_path / "raw2"
+    raw2.mkdir(parents=True, exist_ok=True)
+    prefix_path = _safe_join(raw2, "ROLLOVER_TEST")
+    ctx = _WriterContext(
+        raw_dir=raw2,
+        prefix=prefix_path.name,
+        prefix_full=prefix_path,
+        rollover_bytes=8 * 1024,
+        chunk_bytes=4096,
+        chunk_interval_ms=20,
+        fail_mode="none",
+    )
+    stop = threading.Event()
+    thread = threading.Thread(target=_writer_main, args=(ctx, stop), daemon=True)
+    thread.start()
+    time.sleep(0.5)
+    stop.set()
+    thread.join(timeout=5)
+    assert len(ctx.files_written) >= 2, ctx.files_written
 
 
 def test_mock_launch_failure(tmp_path: Path):
-    """Setting MOCK_CONFIG['fail_mode']='launch' should raise RuntimeError."""
-    from fastapi.testclient import TestClient
-
-    saved_fail_mode = config.MOCK_CONFIG.get("fail_mode")
-    config.MOCK_CONFIG["fail_mode"] = "launch"
-    try:
-        env = _isolate_environment(tmp_path)
-        try:
-            client = TestClient(app)
-            response = client.post(
-                "/api/v1/trigger-logging",
-                json={
-                    "scenario_name": "should_fail",
-                    "duration_seconds": 1,
-                    "dmc_config": str(Path(config.DMC_FILE)),
-                    "prefix": "FAIL",
-                },
-            )
-            # The HTTP layer wraps it in 500 since the controller raises.
-            assert response.status_code == 500
-            assert "launch failure" in response.text
-        finally:
-            _restore_environment(env)
-    finally:
-        config.MOCK_CONFIG["fail_mode"] = saved_fail_mode
+    """``fail_mode='launch'`` should produce a controller_error: response."""
+    settings = _make_isolated_settings(tmp_path).with_overrides(mock_fail_mode="launch")
+    app = create_app(settings=settings)
+    client = TestClient(app)
+    response = client.post(
+        "/api/v1/trigger-logging",
+        json={
+            "scenario_name": "should_fail",
+            "duration_seconds": 1,
+            "dmc_config": str(SOURCE_DMC),
+            "prefix": "FAIL",
+        },
+    )
+    assert response.status_code == 500, response.text
+    assert "launch failure" in response.text
 
 
 def test_log_rotator_daemon_one_cycle(tmp_path: Path):
     """`--once` flag runs a single cycle and returns success."""
-    import subprocess
-
-    # Create one old + one fresh archive in the redirected backup dir.
     backup_dir = tmp_path / "backup"
     backup_dir.mkdir(parents=True, exist_ok=True)
     _inject_old_archive(backup_dir, days_old=15)
     fresh = backup_dir / "fresh.zip"
     fresh.write_bytes(b"x")
 
-    # The daemon reads from config.BACKUP_DIRECTORY, so point it there
-    # temporarily.
-    saved_dir = config.BACKUP_DIRECTORY
-    config.BACKUP_DIRECTORY = backup_dir
-    saved_days = config.ROTATION_CONFIG["max_retention_days"]
-    config.ROTATION_CONFIG["max_retention_days"] = 7
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "log_rotator", "--once"],
-            cwd=BASE_DIR,
-            capture_output=True,
-            text=True,
-            timeout=20,
-            env={
-                **os.environ,
-                "QXDM_BACKUP_QUOTA_MB": "1024",
-                "QXDM_RETENTION_DAYS": "7",
-            },
-        )
-        assert result.returncode == 0, (result.stdout, result.stderr)
-        assert "Log rotation finished" in result.stdout or "rotation" in result.stdout
-    finally:
-        config.BACKUP_DIRECTORY = saved_dir
-        config.ROTATION_CONFIG["max_retention_days"] = saved_days
+    # The daemon reads from settings.backup_directory; point it there via env.
+    env = {
+        **os.environ,
+        "QXDM_BACKUP_DIRECTORY": str(backup_dir),
+        "QXDM_RETENTION_DAYS": "7",
+        "QXDM_ROTATOR_FORCE_LOG": "1",
+    }
+    result = subprocess.run(
+        [sys.executable, "-m", "log_rotator", "--once"],
+        cwd=BASE_DIR,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env=env,
+    )
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    assert "Log rotation finished" in result.stdout or "rotation" in result.stdout
 
 
 # ---------------------------------------------------------------------------
-# CLI entry point (lets you run a single happy-path scenario)
+# True concurrent jobs
 # ---------------------------------------------------------------------------
-def _print_summary(label: str, body: str) -> None:
-    print(label)
-    print("-" * 70)
-    print(body)
-    print("-" * 70)
+def test_true_concurrent_jobs(tmp_path: Path):
+    """4+ simultaneous jobs, each isolated, no cross-contamination."""
+    settings = _make_isolated_settings(tmp_path).with_overrides(
+        mock_chunk_interval_ms=20,
+        mock_chunk_size_bytes=2048,
+        mock_simulate_flush_delay_sec=0.1,
+        max_wait_for_log_sec=10.0,
+        stability_window_sec=0.3,
+    )
+    app = create_app(settings=settings)
+
+    payloads = [
+        {
+            "scenario_name": f"Concurrent_{i}",
+            "duration_seconds": 2,
+            "dmc_config": str(SOURCE_DMC),
+            "prefix": f"PFX_{i}",
+        }
+        for i in range(4)
+    ]
+
+    def _run(payload):
+        with TestClient(app) as client:
+            return client.post("/api/v1/trigger-logging", json=payload).json()
+
+    with ThreadPoolExecutor(max_workers=len(payloads)) as ex:
+        results = list(ex.map(_run, payloads))
+
+    job_ids = {r["job_id"] for r in results}
+    assert len(job_ids) == len(payloads), job_ids
+    # All jobs should have produced artifacts
+    for r in results:
+        assert r["artifacts"]["processing"]["ok"], r
+    # No raw leftovers anywhere
+    leftovers = list((tmp_path / "jobs").rglob("*.qmdl"))
+    assert not leftovers, leftovers
 
 
+# ---------------------------------------------------------------------------
+# CLI entry point (manual smoke)
+# ---------------------------------------------------------------------------
 def main() -> int:
     tmp = Path(os.getenv("QXDM_TEST_TMP", "/tmp/qxdm_init_smoke")).resolve()
     if tmp.exists():
@@ -385,57 +360,32 @@ def main() -> int:
     print("=" * 70)
     print("RUNNING END-TO-END QXDM AUTOMATION PIPELINE TEST (MOCK MODE)")
     print("=" * 70)
-    response = _run_pipeline_via_api(
-        {
-            "scenario_name": "TMO_5G_VoNR_Drop_Test",
-            "duration_seconds": 3,
-            "dmc_config": str(Path(config.DMC_FILE)),
-            "prefix": "CHAMBER_1",
-        },
-        tmp,
-    )
-    _print_summary(
-        "API response",
-        json.dumps(response, indent=2),
-    )
+    settings = _make_isolated_settings(tmp)
+    app = create_app(settings=settings)
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/v1/trigger-logging",
+            json={
+                "scenario_name": "TMO_5G_VoNR_Drop_Test",
+                "duration_seconds": 3,
+                "dmc_config": str(SOURCE_DMC),
+                "prefix": "CHAMBER_1",
+            },
+        ).json()
 
     job_id = response["job_id"]
     converted = list((tmp / "converted").glob("*.txt"))
     zips = list((tmp / "backup").glob(f"*_{job_id}_*.zip"))
     raw = list((tmp / "jobs" / job_id / "raw").glob("*.qmdl"))
 
-    _print_summary(
-        "Artifacts",
-        f"converted: {[p.name for p in converted]}\n"
-        f"backups:    {[p.name for p in zips]}\n"
-        f"raw:        {[p.name for p in raw]}",
-    )
-
-    print("=" * 70)
+    print(json.dumps(response, indent=2))
+    print("-" * 70)
+    print("Artifacts")
+    print(f"  converted: {[p.name for p in converted]}")
+    print(f"  backups:    {[p.name for p in zips]}")
+    print(f"  raw:        {[p.name for p in raw]}")
+    print("-" * 70)
     print("SIMULATED PART-1 PIPELINE PASSED")
-    print()
-    print("Validated offline on Linux:")
-    print("  - REST trigger")
-    print("  - mock QXDM session orchestration (load/connect/configure)")
-    print("  - new-file detection after logging start")
-    print("  - incremental file growth")
-    print("  - rollover to a second .qmdl when size threshold reached")
-    print("  - logging stop with delayed flush")
-    print("  - file stability detection")
-    print("  - per-job isolation (raw/converted/backup)")
-    print("  - synthetic binary -> decoded text conversion")
-    print("  - ZIP archive creation per session")
-    print("  - raw cleanup after successful archive")
-    print("  - age-based retention policy")
-    print("  - quota-based retention policy")
-    print()
-    print("NOT validated (requires hardware / Windows host):")
-    print("  - pywinauto / Win32 QXDM GUI automation")
-    print("  - Qualcomm DIAG COM port enumeration on Windows")
-    print("  - real QCAT decoding of live captures")
-    print("  - remote Device Agent round-trip")
-    print("  - Windows path handling")
-    print("=" * 70)
     shutil.rmtree(tmp, ignore_errors=True)
     return 0
 

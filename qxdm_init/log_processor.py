@@ -3,16 +3,14 @@ Log Processing Pipeline.
 
 Responsibilities
 ----------------
-* Convert per-job binary diagnostics (.qmdl/.dlf/...) into plain text.
-* Compress the original binaries into the global BACKUP_DIRECTORY.
-* Enforce isolation: NEVER scan the global raw directory; only operate
-  on the *exact* binary file paths passed in by the controller.
-
-Configuration
--------------
-The decoder is selected by ``config.MOCK_MODE``.  In production we
-**never** fall back to the synthetic decoder if QCAT is missing - we
-raise so an operator notices the misconfiguration.
+* Convert per-job binary diagnostics (``.qmdl``/``.dlf``/...) into plain
+  text via the :class:`qxdm_init.decoders.LogDecoder` interface.
+* Compress the original binaries into the global backup directory.
+* Enforce isolation: only operate on the **exact** binary file paths
+  passed in by the controller -- never scan a global raw directory.
+* Transactional: if any step fails, the original raw binary is preserved
+  and the failure is reported in :class:`ProcessingResult`.  Success only
+  happens after decode + archive + zip validation.
 """
 
 from __future__ import annotations
@@ -20,7 +18,8 @@ from __future__ import annotations
 import json
 import logging
 import os
-import subprocess
+import shutil
+import tempfile
 import zipfile
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -28,10 +27,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
-    import config  # type: ignore
-except (ImportError, ModuleNotFoundError):
-    from . import config  # type: ignore
-
+    from .decoders import LogDecoder, build_decoder
+    from .manifest import ManifestArtifact
+    from .settings import Settings
+except ImportError:
+    from decoders import LogDecoder, build_decoder  # type: ignore
+    from manifest import ManifestArtifact  # type: ignore
+    from settings import Settings  # type: ignore
 
 log = logging.getLogger("Log_Processor")
 
@@ -48,8 +50,19 @@ class ProcessedArtifact:
     binary_archive: Path
     text_log: Optional[Path]
     decoded_lines: int = 0
-    decoder: str = ""  # "mock" | "qcat"
+    decoder: str = ""
     notes: List[str] = field(default_factory=list)
+
+    def to_manifest(self) -> ManifestArtifact:
+        return ManifestArtifact(
+            filename=Path(self.binary_archive).name,
+            size_bytes=Path(self.binary_archive).stat().st_size if Path(self.binary_archive).exists() else 0,
+            archive_path=str(self.binary_archive),
+            text_log_path=str(self.text_log) if self.text_log else None,
+            decoder=self.decoder,
+            decoded_lines=self.decoded_lines,
+            notes=list(self.notes),
+        )
 
     def to_dict(self) -> Dict[str, Any]:
         d = asdict(self)
@@ -64,6 +77,7 @@ class ProcessingResult:
     scenario_name: str
     artifacts: List[ProcessedArtifact] = field(default_factory=list)
     failures: List[Dict[str, str]] = field(default_factory=list)
+    deleted_raw: List[str] = field(default_factory=list)
 
     @property
     def ok(self) -> bool:
@@ -76,193 +90,21 @@ class ProcessingResult:
             "ok": self.ok,
             "artifacts": [a.to_dict() for a in self.artifacts],
             "failures": list(self.failures),
+            "deleted_raw": list(self.deleted_raw),
         }
 
 
 # ---------------------------------------------------------------------------
-# Decoder implementations
+# Filename helpers
 # ---------------------------------------------------------------------------
-def _decode_with_mock(binary: Path, text_out: Path, scenario_name: str) -> int:
-    """Generate a synthetic decoded-text log entry."""
-    text_out.parent.mkdir(parents=True, exist_ok=True)
-    lines = [
-        f"=== QXDM DECODED LOG FILE: {binary.name} ===",
-        f"Scenario: {scenario_name}",
-        f"Decoded Time: {datetime.now().isoformat()}",
-        "2026-08-27 10:48:00.120 [0x1544] LTE Serving Cell Info: "
-        "RSRP=-88dBm RSRQ=-10dB SNR=18.5dB PCI=142",
-        "2026-08-27 10:48:00.250 [0x1FEA] RRC_OTA_MSG: RRCReconfiguration complete",
-        "2026-08-27 10:48:01.010 [0xB80A] 5GMM_REGISTRATION_REJECT: "
-        "Cause #22 (Congestion), T3346=30s",
-    ]
-    text_out.write_text("\n".join(lines) + "\n", encoding="utf-8")
-    return len(lines)
+_FILENAME_SAFE_KEEP = (
+    "-_.abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+)
 
 
-def _decode_with_qcat(binary: Path, text_out: Path) -> int:
-    """Invoke the real QCAT decoder. Raises on failure."""
-    if not os.path.isfile(config.CONVERTER_EXE):
-        raise RuntimeError(
-            f"QCAT converter not found at {config.CONVERTER_EXE!r}. "
-            "Set QCAT_EXE or run with QXDM_MOCK_MODE=True."
-        )
-    text_out.parent.mkdir(parents=True, exist_ok=True)
-    cmd = [config.CONVERTER_EXE, str(binary), str(text_out)]
-    log.info("Executing QCAT (%s) on %s", config.CONVERTER_EXE, binary.name)
-    try:
-        res = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=1800,
-            check=False,
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError(
-            f"QCAT executable not runnable: {config.CONVERTER_EXE}"
-        ) from exc
-    if res.returncode != 0:
-        raise RuntimeError(
-            f"QCAT failed for {binary.name}: rc={res.returncode} "
-            f"stderr={res.stderr.strip()[:500]!r}"
-        )
-    if not text_out.exists():
-        raise RuntimeError(
-            f"QCAT returned 0 but produced no output file at {text_out}"
-        )
-    # crude line count
-    with text_out.open("r", encoding="utf-8", errors="replace") as fh:
-        lines = sum(1 for _ in fh)
-    return lines
-
-
-def _decode_one(
-    binary: Path, text_out: Path, scenario_name: str
-) -> tuple[int, str]:
-    """Run the appropriate decoder; return (line_count, decoder_label)."""
-    if config.MOCK_MODE:
-        return _decode_with_mock(binary, text_out, scenario_name), "mock"
-    return _decode_with_qcat(binary, text_out), "qcat"
-
-
-# ---------------------------------------------------------------------------
-# Public API
-# ---------------------------------------------------------------------------
-def convert_and_archive(
-    scenario_name: str,
-    job_id: str,
-    binary_files: Optional[List[Path]] = None,
-) -> ProcessingResult:
-    """Process *only* the binary files in ``binary_files`` (per-job set).
-
-    Parameters
-    ----------
-    scenario_name: str
-        Logical scenario tag; used in archive names.
-    job_id: str
-        Unique per-call identifier; used in archive names for traceability.
-    binary_files: list[Path] | None
-        The exact set of files captured by the QXDM session.  When None
-        and the global LOG_DIRECTORY is the *job-isolated* raw dir, we
-        scan that directory instead.
-
-    Returns
-    -------
-    ProcessingResult
-    Structured outcome with per-artifact info and any failure details.
-    """
-    if not binary_files:
-        log.warning(
-            "convert_and_archive called with no binary_files (job_id=%s, "
-            "scenario=%s) - this is normal only if the controller "
-            "captured nothing.",
-            job_id,
-            scenario_name,
-        )
-        return ProcessingResult(job_id=job_id, scenario_name=scenario_name)
-
-    result = ProcessingResult(job_id=job_id, scenario_name=scenario_name)
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-
-    for bin_path in binary_files:
-        bin_path = Path(bin_path)
-        if not bin_path.exists():
-            msg = f"missing binary file: {bin_path}"
-            log.error(msg)
-            result.failures.append({"file": str(bin_path), "reason": msg})
-            continue
-
-        # resolved output paths - the *text* log lives in the global
-        # CONVERTED_DIRECTORY so downstream DB indexing can find it; the
-        # *zip* archive is also global so retention is enforced.
-        sanitized_stem = _safe_zip_stem(bin_path.stem)
-        archive_name = (
-            f"{_safe_filename(scenario_name)}_"
-            f"{sanitized_stem}_"
-            f"{job_id}_{timestamp}.zip"
-        )
-        zip_path = config.BACKUP_DIRECTORY / archive_name
-        text_out = config.CONVERTED_DIRECTORY / (
-            sanitized_stem + f"_{job_id}.txt"
-        )
-
-        # 1. convert
-        try:
-            line_count, decoder = _decode_one(bin_path, text_out, scenario_name)
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Conversion failed for %s", bin_path)
-            result.failures.append({
-                "file": str(bin_path),
-                "reason": str(exc),
-            })
-            continue
-
-        # 2. compress raw binary into backup
-        if zip_path.exists():
-            log.warning("Overwriting existing archive %s", zip_path)
-        zip_path.parent.mkdir(parents=True, exist_ok=True)
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.write(bin_path, arcname=bin_path.name)
-
-        # 3. cleanup the raw file in the *job* directory only
-        try:
-            bin_path.unlink()
-        except OSError as exc:
-            log.warning("Could not delete raw file %s: %s", bin_path, exc)
-
-        result.artifacts.append(
-            ProcessedArtifact(
-                job_id=job_id,
-                scenario_name=scenario_name,
-                binary_archive=zip_path,
-                text_log=text_out if text_out.exists() else None,
-                decoded_lines=line_count,
-                decoder=decoder,
-            )
-        )
-        log.info(
-            "Archived %s -> %s (decoder=%s, %d lines)",
-            bin_path.name,
-            zip_path.name,
-            decoder,
-            line_count,
-        )
-
-    log.info(
-        "convert_and_archive done: %d artifacts, %d failures",
-        len(result.artifacts),
-        len(result.failures),
-    )
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Path safety helpers
-# ---------------------------------------------------------------------------
 def _safe_filename(value: str, max_len: int = 80) -> str:
-    """Sanitise a string for safe use in filenames."""
-    keep = "-_.abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    cleaned = "".join(c if c in keep else "_" for c in (value or "scenario"))
+    cleaned = "".join(c if c in _FILENAME_SAFE_KEEP else "_" for c in (value or "scenario"))
     cleaned = cleaned.strip("._")
     return (cleaned or "scenario")[:max_len]
 
@@ -272,27 +114,204 @@ def _safe_zip_stem(stem: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Entry point
+# Processing engine
+# ---------------------------------------------------------------------------
+class LogProcessor:
+    """Stateless processor that converts + archives binaries for one job."""
+
+    def __init__(self, settings: Settings, decoder: Optional[LogDecoder] = None):
+        self.settings = settings
+        self.decoder = decoder or build_decoder(
+            decoder_kind=settings.decoder_kind,
+            decoder_template=settings.decoder_template,
+            qcat_exe=settings.qcat_exe,
+        )
+
+    # ------------------------------------------------------------------
+    def convert_and_archive(
+        self,
+        scenario_name: str,
+        job_id: str,
+        binary_files: Optional[List[Path]] = None,
+    ) -> ProcessingResult:
+        result = ProcessingResult(job_id=job_id, scenario_name=scenario_name)
+        if not binary_files:
+            log.warning(
+                "convert_and_archive called with no binary_files (job_id=%s, "
+                "scenario=%s) - normal only if the controller captured nothing.",
+                job_id,
+                scenario_name,
+            )
+            return result
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        for raw in binary_files:
+            bin_path = Path(raw)
+            if not bin_path.exists():
+                msg = f"missing binary file: {bin_path}"
+                log.error(msg)
+                result.failures.append({"file": str(bin_path), "reason": msg})
+                continue
+
+            # 1. decode (writes to .part then atomically renames)
+            sanitized_stem = _safe_zip_stem(bin_path.stem)
+            archive_name = (
+                f"{_safe_filename(scenario_name)}_"
+                f"{sanitized_stem}_{job_id}_{timestamp}.zip"
+            )
+            zip_path = self.settings.backup_directory / archive_name
+            text_out = self.settings.converted_directory / (
+                sanitized_stem + f"_{job_id}.txt"
+            )
+
+            try:
+                decoder_result = self.decoder.decode(
+                    binary=bin_path,
+                    text_out=text_out,
+                    scenario_name=scenario_name,
+                )
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Conversion failed for %s", bin_path)
+                result.failures.append({
+                    "file": str(bin_path),
+                    "reason": f"decoder_error: {exc}",
+                })
+                # Raw binary must remain for debugging.
+                continue
+
+            # 2. archive raw binary atomically
+            try:
+                self._create_archive(zip_path, bin_path)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Archive failed for %s", bin_path)
+                result.failures.append({
+                    "file": str(bin_path),
+                    "reason": f"archive_error: {exc}",
+                })
+                # Leave the decoded text in place but keep raw; do not
+                # pretend success.
+                continue
+
+            # 3. validate archive contents
+            try:
+                self._validate_archive(zip_path, bin_path)
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Archive validation failed for %s", zip_path)
+                result.failures.append({
+                    "file": str(bin_path),
+                    "reason": f"archive_validation_error: {exc}",
+                })
+                # Remove the bad archive so it doesn't pollute retention.
+                try:
+                    zip_path.unlink()
+                except OSError:
+                    pass
+                continue
+
+            # 4. only NOW remove the raw binary
+            try:
+                bin_path.unlink()
+                result.deleted_raw.append(str(bin_path))
+            except OSError as exc:
+                log.warning("Could not delete raw %s: %s", bin_path, exc)
+                # Not a fatal failure -- archive is good.
+
+            result.artifacts.append(
+                ProcessedArtifact(
+                    job_id=job_id,
+                    scenario_name=scenario_name,
+                    binary_archive=zip_path,
+                    text_log=decoder_result.text_log
+                    if decoder_result.text_log.exists()
+                    else None,
+                    decoded_lines=decoder_result.line_count,
+                    decoder=decoder_result.decoder_label,
+                    notes=list(decoder_result.notes),
+                )
+            )
+            log.info(
+                "Archived %s -> %s (decoder=%s, %d lines)",
+                bin_path.name,
+                zip_path.name,
+                decoder_result.decoder_label,
+                decoder_result.line_count,
+            )
+        return result
+
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _create_archive(zip_path: Path, bin_path: Path) -> None:
+        zip_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_fd, tmp_name = tempfile.mkstemp(
+            dir=str(zip_path.parent), prefix=f".{zip_path.name}.", suffix=".part"
+        )
+        os.close(tmp_fd)
+        try:
+            with zipfile.ZipFile(tmp_name, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.write(bin_path, arcname=bin_path.name)
+            os.replace(tmp_name, zip_path)
+        except Exception:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _validate_archive(zip_path: Path, bin_path: Path) -> None:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            bad = zf.testzip()
+            if bad is not None:
+                raise RuntimeError(f"zip integrity test failed: {bad}")
+            names = zf.namelist()
+        if bin_path.name not in names:
+            raise RuntimeError(
+                f"archive missing expected entry {bin_path.name!r}: {names!r}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Convenience function (legacy module-level API)
+# ---------------------------------------------------------------------------
+def convert_and_archive(
+    scenario_name: str,
+    job_id: str,
+    binary_files: Optional[List[Path]] = None,
+    settings: Optional[Settings] = None,
+    decoder: Optional[LogDecoder] = None,
+) -> ProcessingResult:
+    """Module-level convenience shim for backwards compatibility."""
+    from .settings import from_env
+    settings = settings or from_env()
+    processor = LogProcessor(settings=settings, decoder=decoder)
+    return processor.convert_and_archive(
+        scenario_name=scenario_name,
+        job_id=job_id,
+        binary_files=binary_files,
+    )
+
+
+# ---------------------------------------------------------------------------
+# CLI
 # ---------------------------------------------------------------------------
 def main() -> int:
     """CLI: convert/zip a known set of binaries without going through HTTP."""
     import argparse
 
+    from .settings import from_env
+
     parser = argparse.ArgumentParser(description="Process QXDM binaries.")
     parser.add_argument("--scenario", required=True)
-    parser.add_argument("--job-id", default=datetime.now().strftime("%Y%m%d%H%M%S"))
     parser.add_argument(
-        "--raw-dir",
-        type=Path,
-        default=None,
-        help="Optional isolated raw dir to glob (per-job only).",
+        "--job-id",
+        default=datetime.now().strftime("%Y%m%d%H%M%S"),
     )
+    parser.add_argument("--raw-dir", type=Path, default=None)
     parser.add_argument(
         "files",
         nargs="*",
         type=Path,
-        help="Explicit binaries to process.  If empty and --raw-dir is "
-        "given, the raw-dir is scanned.",
+        help="Explicit binaries to process.",
     )
     args = parser.parse_args()
 
@@ -301,10 +320,12 @@ def main() -> int:
         for pattern in ("*.dlf", "*.bin", "*.isf", "*.hdf", "*.qmdl"):
             files.extend(sorted(args.raw_dir.glob(pattern)))
 
+    settings = from_env()
     result = convert_and_archive(
         scenario_name=args.scenario,
         job_id=args.job_id,
         binary_files=files,
+        settings=settings,
     )
     print(json.dumps(result.to_dict(), indent=2))
     return 0 if result.ok else 1

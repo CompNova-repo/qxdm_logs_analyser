@@ -1,8 +1,12 @@
 __pycache__/
 *.pyc
+.pytest_cache/
 logs/raw/*
 logs/converted/*
 logs/backup/*
+logs/jobs/*
+logs/manifests/*
+logs/device_agent/*
 !logs/raw/.gitkeep
 !logs/converted/.gitkeep
 !logs/backup/.gitkeep

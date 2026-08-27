@@ -1,79 +1,120 @@
 """
-QXDM Automation Configuration (Linux-native).
+Legacy configuration shim.
 
-All paths are derived from this file's location so the framework works on
-any POSIX system without hard-coded Windows drive letters.
+The new code path uses :class:`qxdm_init.settings.Settings` for dependency
+injection.  This module remains so existing CLI invocations
+(``python api_server.py``, ``python -m log_rotator``) and smoke tests
+continue to work without code changes.
+
+It is **not** safe to mutate the attributes on this module after import;
+production code should construct a ``Settings`` instance instead.  The
+shim simply re-exports the values from a default :func:`from_env` call.
 """
 
+from __future__ import annotations
+
 import os
+import sys
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Base paths
-# ---------------------------------------------------------------------------
-BASE_DIR = Path(__file__).resolve().parent
-JOBS_ROOT = BASE_DIR / "logs" / "jobs"
-LOG_DIRECTORY = BASE_DIR / "logs" / "raw"          # legacy / fallback raw dir
-CONVERTED_DIRECTORY = BASE_DIR / "logs" / "converted"
-BACKUP_DIRECTORY = BASE_DIR / "logs" / "backup"
-CONFIGS_DIRECTORY = BASE_DIR / "configs"
+# Ensure package-relative imports work whether this module is imported as
+# ``qxdm_init.config`` or the flat ``config``.
+if __package__ in (None, ""):
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    from settings import Settings, from_env  # type: ignore  # noqa: E402
+else:
+    from .settings import Settings, from_env  # noqa: E402
 
-# Ensure all canonical directories exist.
-for _p in [
-    JOBS_ROOT,
-    LOG_DIRECTORY,
-    CONVERTED_DIRECTORY,
-    BACKUP_DIRECTORY,
-    CONFIGS_DIRECTORY,
-]:
-    _p.mkdir(parents=True, exist_ok=True)
+_DEFAULT = from_env()
+
 
 # ---------------------------------------------------------------------------
-# Mode toggle (mock vs. real QXDM hardware)
+# Backwards-compatible module-level constants
 # ---------------------------------------------------------------------------
-# True  -> Synthetic .qmdl generation, no QXDM/QCAT required.
-# False -> Real QXDM hardware on a (remote) Windows Device Agent.
-MOCK_MODE = os.getenv("QXDM_MOCK_MODE", "True").lower() in ("true", "1", "yes")
+BASE_DIR = _DEFAULT.base_dir
+JOBS_ROOT = _DEFAULT.jobs_root
+LOG_DIRECTORY = _DEFAULT.legacy_raw_directory
+CONVERTED_DIRECTORY = _DEFAULT.converted_directory
+BACKUP_DIRECTORY = _DEFAULT.backup_directory
+CONFIGS_DIRECTORY = _DEFAULT.configs_directory
+MOCK_MODE = _DEFAULT.mock_mode
 
-# ---------------------------------------------------------------------------
-# Hardware / production configuration
-# ---------------------------------------------------------------------------
-# In production the QXDM GUI runs on a *remote* Windows machine; the Linux
-# controller speaks to it through a Device Agent HTTP/JSON-RPC interface.
-# The Device Agent endpoint and CLI tool overrides come from environment
-# variables; sensible defaults are provided for local Linux development.
-DEFAULT_DEVICE_AGENT_URL = os.getenv("QXDM_DEVICE_AGENT_URL", "http://127.0.0.1:8765")
+DEFAULT_DEVICE_AGENT_URL = _DEFAULT.device_agent_url
 
-# Local tool paths used only on Windows hosts running pywinauto / QCAT.
-# Kept here so an operator can override via environment if needed.
-QXDM_EXE = os.getenv("QXDM_EXE", "/opt/qualcomm/QXDM/QXDM.exe")
-CONVERTER_EXE = os.getenv("QCAT_EXE", "/opt/qualcomm/QCAT/QCAT.exe")
-DMC_FILE = str(CONFIGS_DIRECTORY / "default_test.dmc")
+QXDM_EXE = _DEFAULT.qxdm_exe
+CONVERTER_EXE = _DEFAULT.qcat_exe
+DMC_FILE = str(_DEFAULT.resolved_dmc_file) if _DEFAULT.resolved_dmc_file else str(
+    _DEFAULT.configs_directory / "default_test.dmc"
+)
 
-COM_PORT = os.getenv("QXDM_COM_PORT", "")  # empty string -> auto-detect
-MAX_LOG_SIZE_MB = int(os.getenv("QXDM_MAX_LOG_SIZE_MB", "250"))
-DEFAULT_LOG_DURATION_SEC = int(os.getenv("QXDM_DEFAULT_LOG_DURATION_SEC", "10"))
+COM_PORT = _DEFAULT.com_port
+MAX_LOG_SIZE_MB = _DEFAULT.max_log_size_mb
+DEFAULT_LOG_DURATION_SEC = _DEFAULT.default_log_duration_sec
 
-# ---------------------------------------------------------------------------
-# Log rotator / retention policy
-# ---------------------------------------------------------------------------
 ROTATION_CONFIG = {
-    "max_retention_days": int(os.getenv("QXDM_RETENTION_DAYS", "7")),
-    "max_backup_dir_mb": int(os.getenv("QXDM_BACKUP_QUOTA_MB", "1024")),
-    "check_interval_sec": int(os.getenv("QXDM_ROTATION_INTERVAL_SEC", "3600")),
-    "stability_window_sec": int(os.getenv("QXDM_STABILITY_WINDOW_SEC", "5")),
-    "max_wait_for_log_sec": int(os.getenv("QXDM_MAX_WAIT_FOR_LOG_SEC", "60")),
+    "max_retention_days": _DEFAULT.retention_days,
+    "max_backup_dir_mb": _DEFAULT.backup_quota_mb,
+    "check_interval_sec": _DEFAULT.rotation_interval_sec,
+    "stability_window_sec": _DEFAULT.stability_window_sec,
+    "max_wait_for_log_sec": _DEFAULT.max_wait_for_log_sec,
+    "max_wait_for_stability_sec": _DEFAULT.max_wait_for_stability_sec,
 }
 
-# ---------------------------------------------------------------------------
-# Mock controller tunables (Linux-only, used by MockQXDMController)
-# ---------------------------------------------------------------------------
 MOCK_CONFIG = {
-    "chunk_interval_ms": 200,          # how often to append data while logging
-    "chunk_size_bytes": 4096,          # payload per tick
-    "rollover_mb": 1,                   # rollover threshold (override MAX_LOG_SIZE_MB
-                                        # to keep tests fast)
-    "rollover_chunk_budget": 256,       # max chunks per file in mocked rollover
-    "simulate_flush_delay_sec": 1.5,   # sleep between "stop" and final flush
-    "fail_mode": os.getenv("QXDM_MOCK_FAIL", "none"),  # none|launch|connect|no_log|crash
+    "chunk_interval_ms": _DEFAULT.mock_chunk_interval_ms,
+    "chunk_size_bytes": _DEFAULT.mock_chunk_size_bytes,
+    "rollover_mb": _DEFAULT.mock_rollover_mb,
+    "rollover_chunk_budget": 256,
+    "simulate_flush_delay_sec": _DEFAULT.mock_simulate_flush_delay_sec,
+    "fail_mode": _DEFAULT.mock_fail_mode,
 }
+
+
+# ---------------------------------------------------------------------------
+# Settings accessor (preferred)
+# ---------------------------------------------------------------------------
+def get_settings() -> Settings:
+    """Return the current default :class:`Settings` instance."""
+    return _DEFAULT
+
+
+def reload_from_env() -> Settings:
+    """Force-rebuild the default settings from the current environment."""
+    global _DEFAULT, JOBS_ROOT, LOG_DIRECTORY, CONVERTED_DIRECTORY, BACKUP_DIRECTORY
+    global CONFIGS_DIRECTORY, MOCK_MODE, DMC_FILE, COM_PORT, MAX_LOG_SIZE_MB
+    global DEFAULT_LOG_DURATION_SEC, ROTATION_CONFIG, MOCK_CONFIG
+    global DEFAULT_DEVICE_AGENT_URL, QXDM_EXE, CONVERTER_EXE
+
+    _DEFAULT = from_env()
+    JOBS_ROOT = _DEFAULT.jobs_root
+    LOG_DIRECTORY = _DEFAULT.legacy_raw_directory
+    CONVERTED_DIRECTORY = _DEFAULT.converted_directory
+    BACKUP_DIRECTORY = _DEFAULT.backup_directory
+    CONFIGS_DIRECTORY = _DEFAULT.configs_directory
+    MOCK_MODE = _DEFAULT.mock_mode
+    DEFAULT_DEVICE_AGENT_URL = _DEFAULT.device_agent_url
+    QXDM_EXE = _DEFAULT.qxdm_exe
+    CONVERTER_EXE = _DEFAULT.qcat_exe
+    COM_PORT = _DEFAULT.com_port
+    MAX_LOG_SIZE_MB = _DEFAULT.max_log_size_mb
+    DEFAULT_LOG_DURATION_SEC = _DEFAULT.default_log_duration_sec
+    DMC_FILE = str(_DEFAULT.resolved_dmc_file) if _DEFAULT.resolved_dmc_file else str(
+        _DEFAULT.configs_directory / "default_test.dmc"
+    )
+    ROTATION_CONFIG.update({
+        "max_retention_days": _DEFAULT.retention_days,
+        "max_backup_dir_mb": _DEFAULT.backup_quota_mb,
+        "check_interval_sec": _DEFAULT.rotation_interval_sec,
+        "stability_window_sec": _DEFAULT.stability_window_sec,
+        "max_wait_for_log_sec": _DEFAULT.max_wait_for_log_sec,
+        "max_wait_for_stability_sec": _DEFAULT.max_wait_for_stability_sec,
+    })
+    MOCK_CONFIG.update({
+        "chunk_interval_ms": _DEFAULT.mock_chunk_interval_ms,
+        "chunk_size_bytes": _DEFAULT.mock_chunk_size_bytes,
+        "rollover_mb": _DEFAULT.mock_rollover_mb,
+        "rollover_chunk_budget": 256,
+        "simulate_flush_delay_sec": _DEFAULT.mock_simulate_flush_delay_sec,
+        "fail_mode": _DEFAULT.mock_fail_mode,
+    })
+    return _DEFAULT
