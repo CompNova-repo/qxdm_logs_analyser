@@ -162,6 +162,33 @@ def list_events(db_path: str, limit: int) -> list[dict[str, Any]]:
     ]
 
 
+def query_nas(db_path: str, all_events: bool = False) -> list[dict[str, Any]]:
+    """Queries 5GMM/EMM rejects, timers, and cause codes."""
+    conn = connect(db_path)
+    cur = conn.cursor()
+    query = """
+        SELECT timestamp, rat, msg_id, cause_code, cause_str, t3346_timer, t3502_timer
+        FROM nas_events
+    """
+    if not all_events:
+        query += " WHERE cause_code IS NOT NULL"
+    query += " ORDER BY timestamp ASC, sequence ASC"
+    rows = cur.execute(query).fetchall()
+    conn.close()
+    return [
+        {
+            "timestamp": r[0],
+            "rat": r[1],
+            "msg": r[2],
+            "cause_code": r[3],
+            "cause_str": r[4],
+            "t3346_timer": r[5],
+            "t3502_timer": r[6],
+        }
+        for r in rows
+    ]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Query a SQLite index produced by indexer.py."
@@ -175,6 +202,15 @@ def parse_args() -> argparse.Namespace:
     subparsers = parser.add_subparsers(dest="command", required=True)
     subparsers.add_parser("anomalies", help="List likely teardown/failure events")
     subparsers.add_parser("rf-summary", help="Summarize RF KPIs")
+
+    nas_parser = subparsers.add_parser(
+        "nas", help="Query 5GMM/EMM rejects, timers, and cause codes"
+    )
+    nas_parser.add_argument(
+        "--all",
+        action="store_true",
+        help="List all NAS events (not only those with cause codes)",
+    )
 
     window_parser = subparsers.add_parser(
         "window", help="Print raw indexed event blocks around a timestamp"
@@ -207,6 +243,8 @@ def main() -> int:
             print(json.dumps(query_anomalies(args.db), indent=2))
         elif args.command == "rf-summary":
             print(json.dumps(get_rf_summary(args.db), indent=2))
+        elif args.command == "nas":
+            print(json.dumps(query_nas(args.db, all_events=args.all), indent=2))
         elif args.command == "window":
             print(get_context_window(args.db, args.timestamp, args.count))
         elif args.command == "events":
