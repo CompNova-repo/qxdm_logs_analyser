@@ -2,3 +2,8 @@
 .env
 CLAUDE.md
 
+.claude/worktrees/
+__pycache__/
+*.pyc
+*.db.bak
+claude_terminal_output.md
