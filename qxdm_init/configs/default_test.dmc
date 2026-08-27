@@ -1,0 +1,10 @@
+# Qualcomm Diag Monitor Configuration (DMC) - Default Test Config
+# Packet Definitions for 4G LTE and 5G NR Logging
+# 0x1544 - LTE Physical Layer RF Metrics (RSRP/RSRQ/SNR)
+# 0x1FEA - RRC Signaling Messages (OTA)
+# 0xB80A - 5G NAS Signaling / 5GMM Protocol
+[QXDM_CONFIG]
+Version=6.0
+AutoConnect=1
+Packets=0x1544,0x1FEA,0xB80A,0xB821,0xB0C0
+FilterName=Default_5G_SA_NSA_Metrics

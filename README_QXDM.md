@@ -7,7 +7,7 @@ first indexing the useful blocks into SQLite.
 ## Files
 
 - `indexer.py` streams a decoded text log into `qxdm_indexed.db`.
-- `qxdm_tool.py` queries the SQLite index for anomalies, RF summaries, and raw
+- `qxdm_tool.py` queries the SQLite index for anomalies, NAS reject causes, RF summaries, and raw
   context windows around failure points.
 
 Both scripts use only the Python standard library.
@@ -31,6 +31,7 @@ Then query the index:
 
 ```bash
 python3 qxdm_tool.py anomalies
+python3 qxdm_tool.py nas
 python3 qxdm_tool.py rf-summary
 python3 qxdm_tool.py window "2024 Nov 1 11:17:29.011"
 ```
