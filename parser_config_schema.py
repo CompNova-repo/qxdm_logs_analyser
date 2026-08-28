@@ -149,6 +149,12 @@ def _validate_parser(parser: dict[str, Any], path: str) -> dict[str, Any]:
 
     match = parser["match"]
     _require(isinstance(match, dict), f"{path}.match", "must be an object")
+    if "mode" in match:
+        _require(
+            match["mode"] in ("any", "all"),
+            f"{path}.match.mode",
+            "must be either 'any' or 'all'",
+        )
 
     def _validate_str_list(key: str) -> None:
         spec_path = f"{path}.match.{key}"

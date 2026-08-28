@@ -12,6 +12,7 @@
       "name": "nas_5gmm",
       "_description": "5G MM / LTE EMM registration / reject causes and T3346/T3502 back-off timers.",
       "match": {
+        "mode": "all",
         "msg_codes": ["0xB80A", "0xB814"],
         "msg_codes_uppercase": ["0XB80A", "0XB814"],
         "text_token_regex": "(?:^|[^A-Z])(5GMM)(?:[^A-Z]|$)"
@@ -39,6 +40,7 @@
       "name": "nas_lte",
       "_description": "LTE NAS EMM rejects (0xB0EC / 0xB0ED). Falls through nas_5gmm when 5GMM token is absent; kept explicit so LTE-only deployments stay clear.",
       "match": {
+        "mode": "all",
         "msg_codes": ["0xB0EC", "0xB0ED"],
         "msg_codes_uppercase": ["0XB0EC", "0XB0ED"],
         "text_token_regex": "(?:^|[^A-Z])(EMM)(?:[^A-Z]|$)"

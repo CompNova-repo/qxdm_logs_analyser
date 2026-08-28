@@ -262,6 +262,28 @@ def parser_failures(
     ]
 
 
+def parser_overlaps(db_path: str, limit: int = 20) -> dict[str, Any]:
+    """Return blocks claimed by multiple parsers and the parser selected."""
+    conn = connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT timestamp, msg_code, selected_parser, claiming_parsers, sample_block "
+            "FROM parser_overlaps ORDER BY id ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        conn.close()
+        return {"overlaps": [], "warning": "parser_overlaps table is missing — re-run indexer.py"}
+    conn.close()
+    return {"overlaps": [
+        {
+            "timestamp": row[0], "msg_code": row[1], "selected_parser": row[2],
+            "claiming_parsers": row[3].split(","), "sample_block": row[4],
+        }
+        for row in rows
+    ]}
+
+
 def unknown_types(db_path: str, limit: int = 20) -> dict[str, Any]:
     """List message codes the indexer did not match, plus a few samples each."""
     conn = connect(db_path)
@@ -354,6 +376,12 @@ def parse_args() -> argparse.Namespace:
         nargs="?",
         help="Optional parser name to filter on, e.g. nr_searcher",
     )
+
+    overlaps_parser = subparsers.add_parser(
+        "parser-overlaps",
+        help="List blocks claimed by multiple parsers and the parser that won",
+    )
+    overlaps_parser.add_argument("--limit", type=int, default=20)
     failures_parser.add_argument(
         "--limit",
         type=int,
@@ -395,6 +423,8 @@ def main() -> int:
                 parser_failures(args.db, args.parser_name, args.limit),
                 indent=2,
             ))
+        elif args.command == "parser-overlaps":
+            print(json.dumps(parser_overlaps(args.db, args.limit), indent=2))
         elif args.command == "unknown-types":
             print(json.dumps(unknown_types(args.db, args.limit), indent=2))
         return 0

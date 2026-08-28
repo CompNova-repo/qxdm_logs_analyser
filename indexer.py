@@ -104,30 +104,34 @@ def _block_matches(parser_cfg: dict[str, Any], code_upper: str,
                    msg_type: str, block_upper: str, block_text: str) -> bool:
     """Decide whether a parser is responsible for this block."""
     match = parser_cfg["match"]
+    results: list[bool] = []
     if match.get("msg_codes_uppercase") and code_upper in match["msg_codes_uppercase"]:
-        return True
+        results.append(True)
+    elif match.get("msg_codes_uppercase"):
+        results.append(False)
     if match.get("msg_codes"):
         # Lowercase form is what QXDM emits natively.
-        if any(code_upper == c.upper() for c in match["msg_codes"]):
-            return True
+        results.append(any(code_upper == c.upper() for c in match["msg_codes"]))
     if match.get("text_tokens_any"):
-        if any(tok.upper() in block_upper for tok in match["text_tokens_any"]):
-            return True
+        results.append(any(tok.upper() in block_upper for tok in match["text_tokens_any"]))
     if match.get("text_token_regex_pattern"):
         # Pre-compiled regex on the upper-cased block text. Use this when you
         # need whole-word matching (e.g. "5GMM" / "EMM" surrounded by
         # non-uppercase delimiters) instead of plain substring containment.
-        return match["text_token_regex_pattern"].search(block_upper) is not None
+        results.append(match["text_token_regex_pattern"].search(block_upper) is not None)
     if match.get("msg_type_contains") and msg_type:
-        if any(tok in msg_type for tok in match["msg_type_contains"]):
-            return True
+        results.append(any(tok in msg_type for tok in match["msg_type_contains"]))
+    elif match.get("msg_type_contains"):
+        results.append(False)
     if match.get("msg_type_starts_with") and msg_type:
-        if msg_type.startswith(match["msg_type_starts_with"]):
-            return True
+        results.append(msg_type.startswith(match["msg_type_starts_with"]))
+    elif match.get("msg_type_starts_with"):
+        results.append(False)
     if match.get("block_text_contains"):
-        if any(tok in block_text for tok in match["block_text_contains"]):
-            return True
-    return False
+        results.append(any(tok in block_text for tok in match["block_text_contains"]))
+    if not results:
+        return False
+    return all(results) if match.get("mode") == "all" else any(results)
 
 
 def _detect_nas_rat(parser_cfg: dict[str, Any], code_upper: str,
@@ -166,6 +170,8 @@ class IndexerState:
     failure_samples: dict[str, list[tuple]] = field(default_factory=lambda: defaultdict(list))
     unknown_msg_codes: dict[str, int] = field(default_factory=lambda: defaultdict(int))
     unknown_samples: dict[str, list[tuple]] = field(default_factory=lambda: defaultdict(list))
+    # (timestamp, msg_code, selected parser, all claiming parsers, sample block)
+    parser_overlaps: list[tuple] = field(default_factory=list)
     total_blocks: int = 0
 
 
@@ -403,6 +409,7 @@ def init_db(db_path: str = "qxdm_indexed.db", append: bool = False) -> sqlite3.C
     cur.execute("DROP TABLE IF EXISTS parser_failures")
     cur.execute("DROP TABLE IF EXISTS unknown_msg_codes")
     cur.execute("DROP TABLE IF EXISTS unknown_samples")
+    cur.execute("DROP TABLE IF EXISTS parser_overlaps")
     cur.execute("""
         CREATE TABLE parser_health (
             parser_name TEXT PRIMARY KEY,
@@ -430,6 +437,13 @@ def init_db(db_path: str = "qxdm_indexed.db", append: bool = False) -> sqlite3.C
         CREATE TABLE unknown_samples (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             msg_code TEXT, timestamp TEXT, msg_type TEXT, sample_block TEXT
+        )
+    """)
+    cur.execute("""
+        CREATE TABLE parser_overlaps (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp TEXT, msg_code TEXT, selected_parser TEXT,
+            claiming_parsers TEXT, sample_block TEXT
         )
     """)
     conn.commit()
@@ -482,64 +496,78 @@ def parse_log(
         block_upper = block_text.upper()
         state.total_blocks += 1
 
-        matched_parser: str | None = None
-        for parser in config["parsers"]:
-            name = parser["name"]
-            if _block_matches(parser, code_upper, current_type,
-                              block_upper, block_text):
-                state.stats[name].matched += 1
-                matched_parser = name
-                parsed_ok = False
-                failure_reason = ""
-                try:
-                    if name in ("nas_5gmm", "nas_lte"):
-                        parsed_ok = _parse_nas(
-                            state, parser, current_ts, current_seq,
-                            current_code, code_upper, current_type,
-                            block_text, block_upper,
-                        )
-                        if not parsed_ok:
-                            failure_reason = "cause regex missed"
-                    elif name == "nr_searcher":
-                        parsed_ok = _parse_nr_searcher(
-                            state, parser, current_ts, current_seq,
-                            current_code, current_type, block_text,
-                            validation, max_block_chars,
-                        )
-                        if not parsed_ok:
-                            failure_reason = "no per-cell rows and no key=value fallback"
-                    elif name == "lte_rf":
-                        parsed_ok = _parse_lte_rf(
-                            state, parser, current_ts, current_seq,
-                            current_code, current_type, block_text,
-                            validation,
-                        )
-                        if not parsed_ok:
-                            failure_reason = "missing rsrp/rsrq"
-                    elif name == "rrc_event":
-                        parsed_ok = _parse_rrc_event(
-                            state, parser, current_ts, current_seq,
-                            current_code, current_type, block_text,
-                        )
-                    elif name == "rrc_state":
-                        parsed_ok = _parse_rrc_state(
-                            state, current_ts, current_seq, current_code,
-                            current_type, block_text,
-                        )
-                except Exception as exc:  # noqa: BLE001 — agent needs to see the sample
-                    failure_reason = f"exception: {type(exc).__name__}: {exc}"
-                    parsed_ok = False
+        claiming_parsers = [
+            parser for parser in config["parsers"]
+            if _block_matches(parser, code_upper, current_type, block_upper, block_text)
+        ]
+        if len(claiming_parsers) > 1:
+            names = [parser["name"] for parser in claiming_parsers]
+            state.parser_overlaps.append((
+                current_ts, current_code, names[0], ",".join(names),
+                block_text[:max_block_chars],
+            ))
+            print(
+                f"[!] Parser overlap at {current_ts} {current_code}: "
+                f"{', '.join(names)}; selected {names[0]}",
+                file=sys.stderr,
+            )
 
-                if parsed_ok:
-                    state.stats[name].parsed += 1
-                else:
-                    state.stats[name].failed += 1
-                    _record_failure(
-                        state, name, current_code, current_ts,
-                        failure_reason or "no extract produced",
-                        block_text, max_samples, max_block_chars,
+        matched_parser: str | None = None
+        for parser in claiming_parsers[:1]:
+            name = parser["name"]
+            state.stats[name].matched += 1
+            matched_parser = name
+            parsed_ok = False
+            failure_reason = ""
+            try:
+                if name in ("nas_5gmm", "nas_lte"):
+                    parsed_ok = _parse_nas(
+                        state, parser, current_ts, current_seq,
+                        current_code, code_upper, current_type,
+                        block_text, block_upper,
                     )
-                break
+                    if not parsed_ok:
+                        failure_reason = "cause regex missed"
+                elif name == "nr_searcher":
+                    parsed_ok = _parse_nr_searcher(
+                        state, parser, current_ts, current_seq,
+                        current_code, current_type, block_text,
+                        validation, max_block_chars,
+                    )
+                    if not parsed_ok:
+                        failure_reason = "no per-cell rows and no key=value fallback"
+                elif name == "lte_rf":
+                    parsed_ok = _parse_lte_rf(
+                        state, parser, current_ts, current_seq,
+                        current_code, current_type, block_text,
+                        validation,
+                    )
+                    if not parsed_ok:
+                        failure_reason = "missing rsrp/rsrq"
+                elif name == "rrc_event":
+                    parsed_ok = _parse_rrc_event(
+                        state, parser, current_ts, current_seq,
+                        current_code, current_type, block_text,
+                    )
+                elif name == "rrc_state":
+                    parsed_ok = _parse_rrc_state(
+                        state, current_ts, current_seq, current_code,
+                        current_type, block_text,
+                    )
+            except Exception as exc:  # noqa: BLE001 — agent needs to see the sample
+                failure_reason = f"exception: {type(exc).__name__}: {exc}"
+                parsed_ok = False
+
+            if parsed_ok:
+                state.stats[name].parsed += 1
+            else:
+                state.stats[name].failed += 1
+                _record_failure(
+                    state, name, current_code, current_ts,
+                    failure_reason or "no extract produced",
+                    block_text, max_samples, max_block_chars,
+                )
+            break
 
         if matched_parser is None:
             _record_unknown(state, code_upper, current_ts, current_type,
@@ -629,6 +657,14 @@ def parse_log(
             unknown_sample_rows,
         )
 
+    if state.parser_overlaps:
+        cur.executemany(
+            "INSERT INTO parser_overlaps "
+            "(timestamp, msg_code, selected_parser, claiming_parsers, sample_block) "
+            "VALUES (?, ?, ?, ?, ?)",
+            state.parser_overlaps,
+        )
+
     conn.commit()
     conn.close()
 
@@ -644,6 +680,7 @@ def parse_log(
             for name, st in state.stats.items()
         },
         "unknown_msg_codes": dict(state.unknown_msg_codes),
+        "parser_overlaps": len(state.parser_overlaps),
     }
     print(
         f"[✓] Indexed {len(state.events)} Events, {len(state.nas)} NAS Records, "

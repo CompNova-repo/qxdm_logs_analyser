@@ -34,7 +34,15 @@ python3 qxdm_tool.py anomalies
 python3 qxdm_tool.py nas
 python3 qxdm_tool.py rf-summary
 python3 qxdm_tool.py window "2024 Nov 1 11:17:29.011"
+python3 qxdm_tool.py parser-overlaps
 ```
+
+Parser match clauses use `"mode": "any"` by default. A parser configured with
+`"mode": "all"` claims a block only when every configured match category is
+satisfied. The NAS parsers use this stricter mode so protocol words in unrelated
+event names or payload fields do not claim a block. If more than one parser does
+claim a block, the first parser still wins deterministically, but the indexer
+prints a warning and records the claim in the `parser_overlaps` table.
 
 Useful extra command:
 
