@@ -15,7 +15,7 @@
         "mode": "all",
         "msg_codes": ["0xB80A", "0xB814"],
         "msg_codes_uppercase": ["0XB80A", "0XB814"],
-        "text_token_regex": "(?:^|[^A-Z])(5GMM)(?:[^A-Z]|$)"
+        "text_token_regex": "(?:^|[^A-Z])5GMM[ _]CAUSE\\s*=(?:[^A-Z]|$)"
       },
       "rat_detection": {
         "nr_codes_uppercase": ["0XB80A", "0XB814"],
@@ -43,7 +43,7 @@
         "mode": "all",
         "msg_codes": ["0xB0EC", "0xB0ED"],
         "msg_codes_uppercase": ["0XB0EC", "0XB0ED"],
-        "text_token_regex": "(?:^|[^A-Z])(EMM)(?:[^A-Z]|$)"
+        "text_token_regex": "(?:^|[^A-Z])EMM[ _]CAUSE\\s*=(?:[^A-Z]|$)"
       },
       "extract": {
         "cause": {

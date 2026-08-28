@@ -770,31 +770,22 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Guard against the dry-run footgun: a user who runs ``indexer.py <log>
-    # --dry-run`` to "test the new config" is probably not aware that
-    # ``qxdm_indexed.db`` is the production DB and that --dry-run rewrites
-    # it from scratch. Default the DB to a scratch path whenever dry-run is
-    # set and the user did not pass an explicit db_path. Refuse to overwrite
-    # the production DB without --append, regardless of dry-run.
+    # --dry-run`` is probably not aware that ``qxdm_indexed.db`` is the
+    # production DB. Redirect to a scratch DB so --dry-run never clobbers
+    # production. ``init_db()`` will unlink and rebuild the scratch DB on
+    # each --dry-run invocation, so repeated dry-runs against the same log
+    # are safe and don't require --append. Default rebuilds
+    # (``indexer.py <log> qxdm_indexed.db`` without --append) are the
+    # documented rebuild workflow and proceed via the same unlink+rebuild
+    # path.
     db_path = args.db_path
-    db_path_was_default = db_path == "qxdm_indexed.db"
-    if args.dry_run and db_path_was_default:
+    if args.dry_run and db_path == "qxdm_indexed.db":
         db_path = "qxdm_dryrun.db"
         print(
             f"[*] --dry-run: writing to scratch DB {db_path} "
             "(pass an explicit db_path to override)",
             file=sys.stderr,
         )
-    if db_path_was_default and not args.append:
-        # Without --append we would unlink the production DB. Bail rather
-        # than risk a 30 MB data loss.
-        if Path(db_path).exists():
-            print(
-                f"error: refusing to overwrite {db_path} without --append. "
-                "Use --append to keep the existing data or pass a different "
-                "db_path.",
-                file=sys.stderr,
-            )
-            raise SystemExit(2)
 
     try:
         health = parse_log(

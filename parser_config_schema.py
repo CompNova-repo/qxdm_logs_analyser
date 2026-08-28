@@ -182,8 +182,12 @@ def _validate_parser(parser: dict[str, Any], path: str) -> dict[str, Any]:
             "must be a regex string",
         )
         try:
+            # NOTE: no re.IGNORECASE — indexer upper-cases the block text
+            # before searching (``block_upper = block_text.upper()``), so the
+            # regex only needs to match uppercase forms. Leaving the flag on
+            # costs a tiny bit of per-block CPU and misleads maintainers.
             match["text_token_regex_pattern"] = re.compile(
-                match["text_token_regex"], re.IGNORECASE
+                match["text_token_regex"]
             )
         except re.error as exc:
             raise ConfigValidationError(

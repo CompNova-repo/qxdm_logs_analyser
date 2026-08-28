@@ -221,11 +221,17 @@ def parser_failures(
     db_path: str,
     parser_name: str | None = None,
     limit: int = 10,
-) -> list[dict[str, Any]]:
+) -> list[dict[str, Any]] | dict[str, Any]:
     """Return representative failure samples the indexer captured.
 
     If ``parser_name`` is ``None`` every parser with at least one failure is
     included. Otherwise only that parser is queried.
+
+    Returns a list of failure dicts on the happy path. When the
+    ``parser_failures`` table is absent (e.g. before the first indexer run)
+    a uniform ``{"failures": [], "warning": "..."}`` envelope is returned
+    instead — the union return type documents this branch so callers
+    type-check it explicitly.
     """
     conn = connect(db_path)
     cur = conn.cursor()
@@ -298,13 +304,24 @@ def unknown_types(db_path: str, limit: int = 20) -> dict[str, Any]:
         conn.close()
         return {"unknown_msg_codes": [], "warning": "unknown_msg_codes table is missing"}
 
+    samples_table_missing = False
     out_codes = []
     for code, occ, sample_count in code_rows:
-        samples = cur.execute(
-            "SELECT timestamp, msg_type, sample_block FROM unknown_samples "
-            "WHERE msg_code = ? ORDER BY id ASC LIMIT 3",
-            (code,),
-        ).fetchall()
+        try:
+            samples = cur.execute(
+                "SELECT timestamp, msg_type, sample_block FROM unknown_samples "
+                "WHERE msg_code = ? ORDER BY id ASC LIMIT 3",
+                (code,),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Symmetric with the outer SELECT: if ``unknown_samples`` is
+            # missing but ``unknown_msg_codes`` is populated (e.g. partial
+            # re-index or manual table drop), return the code summary with
+            # an empty sample list rather than crashing with an unhandled
+            # OperationalError. The envelope-level warning surfaces the
+            # partial state to the agent.
+            samples_table_missing = True
+            samples = []
         out_codes.append({
             "msg_code": code,
             "occurrences": occ,
@@ -315,7 +332,12 @@ def unknown_types(db_path: str, limit: int = 20) -> dict[str, Any]:
             ],
         })
     conn.close()
-    return {"unknown_msg_codes": out_codes}
+    envelope: dict[str, Any] = {"unknown_msg_codes": out_codes}
+    if samples_table_missing:
+        envelope["warning"] = (
+            "unknown_samples table is missing — sample details omitted"
+        )
+    return envelope
 
 
 def parse_args() -> argparse.Namespace:
