@@ -720,12 +720,14 @@ def diff_health(
 
     Both arguments use the flat ``{parser_name: {matched, parsed, failed,
     invalid_value}}`` shape returned by ``promote_config._read_health`` and
-    ``parse_log['parsers']``. For each parser in ``after`` the result
-    contains the post-run values plus the per-counter deltas vs. ``before``.
+    ``parse_log['parsers']``. For each parser in the union of ``before``
+    and ``after`` the result contains the post-run values plus the
+    per-counter deltas vs. ``before``.
     """
     diff: dict[str, dict[str, int]] = {}
-    for name, post in after.items():
-        prev = before.get(name, {})
+    for name in set(before) | set(after):
+        post = after.get(name, {"matched": 0, "parsed": 0, "failed": 0, "invalid_value": 0})
+        prev = before.get(name, {"matched": 0, "parsed": 0, "failed": 0, "invalid_value": 0})
         diff[name] = {
             "matched": post["matched"],
             "parsed": post["parsed"],

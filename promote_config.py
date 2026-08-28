@@ -84,11 +84,21 @@ def cmd_validate(args: argparse.Namespace) -> int:
     diff = indexer.diff_health(baseline, candidate_health)
 
     regressions: list[str] = []
-    for name, post in candidate_health.items():
+    for name in set(baseline) | set(candidate_health):
         prev = baseline.get(name, {"matched": 0, "parsed": 0, "failed": 0, "invalid_value": 0})
+        post = candidate_health.get(name, {"matched": 0, "parsed": 0, "failed": 0, "invalid_value": 0})
         # Reject the candidate if any parser's failure count went UP or
         # parsed count went DOWN — the point of a candidate is to fail less
         # and parse more, not more of the same.
+        # Also flag a dropped parser: any parser present in baseline but
+        # absent in candidate indicates the candidate no longer extracts that
+        # message type — always a regression, even if parsed was 0 (failed-only).
+        if name not in candidate_health:
+            regressions.append(
+                f"{name}: parser dropped (baseline matched {prev['matched']}, "
+                f"parsed {prev['parsed']}, failed {prev['failed']})"
+            )
+            continue
         failed_delta = diff[name]["failed_delta"]
         parsed_delta = diff[name]["parsed_delta"]
         if failed_delta > 0:

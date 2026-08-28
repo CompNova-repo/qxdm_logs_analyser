@@ -162,6 +162,12 @@ def test_unknown_samples_match_unknown_codes() -> None:
 
 
 def _run_cli(db_path: str) -> int:
+    # ``DEFAULT_DB`` was already computed at import time from the env var, so
+    # setting ``os.environ["QXDM_DB"]`` alone has no effect on ``_connect()``.
+    # Reassign the module-level path (and keep the env var in sync) so tests
+    # validate the requested candidate DB instead of the import-time default.
+    global DEFAULT_DB
+    DEFAULT_DB = db_path
     os.environ["QXDM_DB"] = db_path
     args = [__file__, "-q"]
     return pytest.main(args)
