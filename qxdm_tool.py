@@ -229,19 +229,26 @@ def parser_failures(
     """
     conn = connect(db_path)
     cur = conn.cursor()
-    if parser_name:
-        rows = cur.execute(
-            "SELECT parser_name, msg_code, timestamp, failure_reason, sample_block "
-            "FROM parser_failures WHERE parser_name = ? "
-            "ORDER BY id ASC LIMIT ?",
-            (parser_name, limit),
-        ).fetchall()
-    else:
-        rows = cur.execute(
-            "SELECT parser_name, msg_code, timestamp, failure_reason, sample_block "
-            "FROM parser_failures ORDER BY id ASC LIMIT ?",
-            (limit,),
-        ).fetchall()
+    try:
+        if parser_name:
+            rows = cur.execute(
+                "SELECT parser_name, msg_code, timestamp, failure_reason, sample_block "
+                "FROM parser_failures WHERE parser_name = ? "
+                "ORDER BY id ASC LIMIT ?",
+                (parser_name, limit),
+            ).fetchall()
+        else:
+            rows = cur.execute(
+                "SELECT parser_name, msg_code, timestamp, failure_reason, sample_block "
+                "FROM parser_failures ORDER BY id ASC LIMIT ?",
+                (limit,),
+            ).fetchall()
+    except sqlite3.OperationalError:
+        conn.close()
+        return {
+            "failures": [],
+            "warning": "parser_failures table is missing — re-run indexer.py",
+        }
     conn.close()
     return [
         {

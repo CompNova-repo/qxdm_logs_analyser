@@ -113,14 +113,11 @@ def _block_matches(parser_cfg: dict[str, Any], code_upper: str,
     if match.get("text_tokens_any"):
         if any(tok.upper() in block_upper for tok in match["text_tokens_any"]):
             return True
-    if match.get("text_token_regex"):
+    if match.get("text_token_regex_pattern"):
         # Pre-compiled regex on the upper-cased block text. Use this when you
         # need whole-word matching (e.g. "5GMM" / "EMM" surrounded by
         # non-uppercase delimiters) instead of plain substring containment.
-        pattern = match["text_token_regex"]
-        if isinstance(pattern, str):
-            return re.search(pattern, block_upper) is not None
-        return pattern.search(block_upper) is not None
+        return match["text_token_regex_pattern"].search(block_upper) is not None
     if match.get("msg_type_contains") and msg_type:
         if any(tok in msg_type for tok in match["msg_type_contains"]):
             return True
@@ -216,6 +213,13 @@ def _parse_nas(state: IndexerState, parser_cfg: dict[str, Any], ts: str, seq: in
             if cause_code is not None
             else "UNKNOWN"
         )
+
+    # If the cause regex missed entirely, the parser matched the block on
+    # msg-code or 5GMM/EMM token alone but couldn't extract the IE. Surface
+    # this as a parser failure (don't silently record a row with cause_code
+    # = NULL — that hides regressions in candidate configs).
+    if cause_code is None:
+        return False
 
     timers = extract["timers"]["spec"]["list"]
     timer_values = {name: decode_gprs_timer2(block_text, name) for name in timers}
@@ -357,8 +361,7 @@ def _parse_rrc_state(state: IndexerState, ts: str, seq: int, code: str,
 # ---------------------------------------------------------------------------
 
 
-def init_db(db_path: str = "qxdm_indexed.db", append: bool = False,
-            keep_health: bool = True) -> sqlite3.Connection:
+def init_db(db_path: str = "qxdm_indexed.db", append: bool = False) -> sqlite3.Connection:
     db_file = Path(db_path)
     if not append and db_file.exists():
         db_file.unlink()
@@ -399,6 +402,7 @@ def init_db(db_path: str = "qxdm_indexed.db", append: bool = False,
     cur.execute("DROP TABLE IF EXISTS parser_health")
     cur.execute("DROP TABLE IF EXISTS parser_failures")
     cur.execute("DROP TABLE IF EXISTS unknown_msg_codes")
+    cur.execute("DROP TABLE IF EXISTS unknown_samples")
     cur.execute("""
         CREATE TABLE parser_health (
             parser_name TEXT PRIMARY KEY,
@@ -541,7 +545,10 @@ def parse_log(
             _record_unknown(state, code_upper, current_ts, current_type,
                             block_text, max_unknown, max_block_chars)
 
-    print(f"[*] Parsing log and building index: {file_path} -> {db_path}")
+    print(
+        f"[*] Parsing log and building index: {file_path} -> {db_path}",
+        file=sys.stderr,
+    )
     with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
         for line in f:
             line_str = line.rstrip()
@@ -641,29 +648,36 @@ def parse_log(
     print(
         f"[✓] Indexed {len(state.events)} Events, {len(state.nas)} NAS Records, "
         f"and {len(state.rf)} RF Measurements. "
-        f"({state.total_blocks} blocks scanned, dry_run={dry_run})"
+        f"({state.total_blocks} blocks scanned, dry_run={dry_run})",
+        file=sys.stderr,
     )
     return health
 
 
-def diff_health(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
-    """Return a compact diff between two health payloads."""
-    diff: dict[str, Any] = {"parsers": {}, "totals": {}}
-    for name, post in after["parsers"].items():
-        prev = before["parsers"].get(name, {})
-        diff["parsers"][name] = {
+def diff_health(
+    before: dict[str, dict[str, int]],
+    after: dict[str, dict[str, int]],
+) -> dict[str, dict[str, int]]:
+    """Return a compact per-parser diff between two health dicts.
+
+    Both arguments use the flat ``{parser_name: {matched, parsed, failed,
+    invalid_value}}`` shape returned by ``promote_config._read_health`` and
+    ``parse_log['parsers']``. For each parser in ``after`` the result
+    contains the post-run values plus the per-counter deltas vs. ``before``.
+    """
+    diff: dict[str, dict[str, int]] = {}
+    for name, post in after.items():
+        prev = before.get(name, {})
+        diff[name] = {
+            "matched": post["matched"],
+            "parsed": post["parsed"],
+            "failed": post["failed"],
+            "invalid_value": post["invalid_value"],
             "matched_delta": post["matched"] - prev.get("matched", 0),
             "parsed_delta": post["parsed"] - prev.get("parsed", 0),
             "failed_delta": post["failed"] - prev.get("failed", 0),
             "invalid_value_delta": post["invalid_value"] - prev.get("invalid_value", 0),
-            "parsed_after": post["parsed"],
-            "failed_after": post["failed"],
         }
-    diff["totals"] = {
-        "matched_after": sum(p["matched"] for p in after["parsers"].values()),
-        "parsed_after": sum(p["parsed"] for p in after["parsers"].values()),
-        "failed_after": sum(p["failed"] for p in after["parsers"].values()),
-    }
     return diff
 
 
@@ -674,11 +688,16 @@ def promote_candidate(candidate_path: str, target_path: str = DEFAULT_CONFIG_PAT
     dst = Path(target_path)
     if not src.exists():
         raise FileNotFoundError(f"candidate config not found: {src}")
+    if src.resolve() == dst.resolve():
+        # Avoid shutil.SameFileError when the candidate and target are the
+        # same path (e.g. user passed --config parser_config.json --promote).
+        print(f"[=] Candidate and target are the same file ({src}); nothing to do.")
+        return
     # Validate before swapping so we don't leave the indexer pointing at a
     # broken config.
     load_config(src)
     shutil.copyfile(src, dst)
-    print(f"[✓] Promoted {src} → {dst}")
+    print(f"[✓] Promoted {src} → {dst}", file=sys.stderr)
 
 
 if __name__ == "__main__":
@@ -701,7 +720,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "--dry-run", action="store_true",
         help="Skip events/nas/rf writes; still populate parser_health and "
-             "parser_failures so the agent can diff against the production DB",
+             "parser_failures so the agent can diff against the production DB. "
+             "Writes to qxdm_dryrun.db by default (override with an explicit "
+             "db_path) to avoid clobbering the production DB.",
     )
     parser.add_argument(
         "--promote", action="store_true",
@@ -710,9 +731,37 @@ if __name__ == "__main__":
     )
 
     args = parser.parse_args()
+
+    # Guard against the dry-run footgun: a user who runs ``indexer.py <log>
+    # --dry-run`` to "test the new config" is probably not aware that
+    # ``qxdm_indexed.db`` is the production DB and that --dry-run rewrites
+    # it from scratch. Default the DB to a scratch path whenever dry-run is
+    # set and the user did not pass an explicit db_path. Refuse to overwrite
+    # the production DB without --append, regardless of dry-run.
+    db_path = args.db_path
+    db_path_was_default = db_path == "qxdm_indexed.db"
+    if args.dry_run and db_path_was_default:
+        db_path = "qxdm_dryrun.db"
+        print(
+            f"[*] --dry-run: writing to scratch DB {db_path} "
+            "(pass an explicit db_path to override)",
+            file=sys.stderr,
+        )
+    if db_path_was_default and not args.append:
+        # Without --append we would unlink the production DB. Bail rather
+        # than risk a 30 MB data loss.
+        if Path(db_path).exists():
+            print(
+                f"error: refusing to overwrite {db_path} without --append. "
+                "Use --append to keep the existing data or pass a different "
+                "db_path.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+
     try:
         health = parse_log(
-            args.log_file, db_path=args.db_path, append=args.append,
+            args.log_file, db_path=db_path, append=args.append,
             config_path=args.config, dry_run=args.dry_run,
         )
     except ConfigValidationError as exc:

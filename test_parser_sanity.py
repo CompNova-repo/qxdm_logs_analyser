@@ -129,9 +129,12 @@ def test_parser_health_consistent() -> None:
         assert matched == parsed + failed, (
             f"{name}: matched={matched} but parsed+fails={parsed + failed}"
         )
-        assert invalid_value <= parsed, (
-            f"{name}: more invalid_value samples ({invalid_value}) than parsed "
-            f"({parsed}) — invalid_value should be a subset of parsed."
+        # Note: invalid_value is bounded by ``matched`` (not ``parsed``) because
+        # some parsers (e.g. ``nr_searcher``) increment invalid_value once per
+        # row, while ``parsed`` counts the parent block.
+        assert invalid_value <= matched, (
+            f"{name}: more invalid_value samples ({invalid_value}) than matched "
+            f"({matched}) — invalid_value must be bounded by matched."
         )
 
 

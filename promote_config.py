@@ -55,6 +55,9 @@ def _read_health(db_path: str) -> dict[str, dict[str, int]]:
 
 def cmd_validate(args: argparse.Namespace) -> int:
     """Dry-run the candidate and diff parser-health against production."""
+    if not Path(args.log).is_file():
+        print(f"error: log file not found: {args.log}", file=sys.stderr)
+        return 2
     try:
         load_config(args.candidate)
     except ConfigValidationError as exc:
@@ -64,7 +67,10 @@ def cmd_validate(args: argparse.Namespace) -> int:
     baseline = _read_health(args.production_db)
 
     candidate_db = args.candidate_db
-    print(f"[*] Dry-run with candidate: {args.candidate} -> {candidate_db}")
+    print(
+        f"[*] Dry-run with candidate: {args.candidate} -> {candidate_db}",
+        file=sys.stderr,
+    )
     indexer.parse_log(
         args.log,
         db_path=candidate_db,
@@ -75,28 +81,25 @@ def cmd_validate(args: argparse.Namespace) -> int:
 
     candidate_health = _read_health(candidate_db)
 
-    diff: dict[str, dict[str, int]] = {}
+    diff = indexer.diff_health(baseline, candidate_health)
+
     regressions: list[str] = []
     for name, post in candidate_health.items():
         prev = baseline.get(name, {"matched": 0, "parsed": 0, "failed": 0, "invalid_value": 0})
-        delta = {
-            "matched_delta": post["matched"] - prev["matched"],
-            "parsed_delta": post["parsed"] - prev["parsed"],
-            "failed_delta": post["failed"] - prev["failed"],
-            "invalid_value_delta": post["invalid_value"] - prev["invalid_value"],
-        }
-        diff[name] = {**post, **delta}
-        # Reject the candidate if any parser's failure count went UP — the
-        # point of a candidate is to fail less, not more.
-        if delta["failed_delta"] > 0:
+        # Reject the candidate if any parser's failure count went UP or
+        # parsed count went DOWN — the point of a candidate is to fail less
+        # and parse more, not more of the same.
+        failed_delta = diff[name]["failed_delta"]
+        parsed_delta = diff[name]["parsed_delta"]
+        if failed_delta > 0:
             regressions.append(
                 f"{name}: failed {prev['failed']} -> {post['failed']} "
-                f"(+{delta['failed_delta']})"
+                f"(+{failed_delta})"
             )
-        if delta["parsed_delta"] < 0:
+        if parsed_delta < 0:
             regressions.append(
                 f"{name}: parsed {prev['parsed']} -> {post['parsed']} "
-                f"({delta['parsed_delta']})"
+                f"({parsed_delta})"
             )
 
     summary = {
@@ -117,7 +120,7 @@ def cmd_validate(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
-    print("[✓] Candidate is healthy enough to promote.")
+    print("[✓] Candidate is healthy enough to promote.", file=sys.stderr)
     return 0
 
 
@@ -133,8 +136,13 @@ def cmd_promote(args: argparse.Namespace) -> int:
     if not src.exists():
         print(f"error: candidate not found: {src}", file=sys.stderr)
         return 1
+    if src.resolve() == dst.resolve():
+        # Avoid shutil.SameFileError when candidate and target resolve to
+        # the same path (e.g. typos in --candidate / --target).
+        print(f"[=] Candidate and target are the same file ({src}); nothing to do.")
+        return 0
     shutil.copyfile(src, dst)
-    print(f"[✓] Promoted {src} -> {dst}")
+    print(f"[✓] Promoted {src} -> {dst}", file=sys.stderr)
     return 0
 
 

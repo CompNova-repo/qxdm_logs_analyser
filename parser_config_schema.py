@@ -150,24 +150,25 @@ def _validate_parser(parser: dict[str, Any], path: str) -> dict[str, Any]:
     match = parser["match"]
     _require(isinstance(match, dict), f"{path}.match", "must be an object")
 
+    def _validate_str_list(key: str) -> None:
+        spec_path = f"{path}.match.{key}"
+        _require(
+            isinstance(match[key], list),
+            spec_path,
+            "must be a list",
+        )
+        _require(
+            all(isinstance(item, str) and item for item in match[key]),
+            spec_path,
+            "must be a list of non-empty strings",
+        )
+
     if "msg_codes" in match:
-        _require(
-            isinstance(match["msg_codes"], list),
-            f"{path}.match.msg_codes",
-            "must be a list",
-        )
+        _validate_str_list("msg_codes")
     if "msg_codes_uppercase" in match:
-        _require(
-            isinstance(match["msg_codes_uppercase"], list),
-            f"{path}.match.msg_codes_uppercase",
-            "must be a list",
-        )
+        _validate_str_list("msg_codes_uppercase")
     if "text_tokens_any" in match:
-        _require(
-            isinstance(match["text_tokens_any"], list),
-            f"{path}.match.text_tokens_any",
-            "must be a list",
-        )
+        _validate_str_list("text_tokens_any")
     if "text_token_regex" in match:
         _require(
             isinstance(match["text_token_regex"], str),
@@ -175,17 +176,15 @@ def _validate_parser(parser: dict[str, Any], path: str) -> dict[str, Any]:
             "must be a regex string",
         )
         try:
-            re.compile(match["text_token_regex"])
+            match["text_token_regex_pattern"] = re.compile(
+                match["text_token_regex"], re.IGNORECASE
+            )
         except re.error as exc:
             raise ConfigValidationError(
                 f"{path}.match.text_token_regex: invalid regex: {exc}"
             ) from exc
     if "msg_type_contains" in match:
-        _require(
-            isinstance(match["msg_type_contains"], list),
-            f"{path}.match.msg_type_contains",
-            "must be a list",
-        )
+        _validate_str_list("msg_type_contains")
 
     compiled: dict[str, Any] = {"name": parser["name"], "match": match, "extract": {}}
     if "extract" in parser:
@@ -197,9 +196,47 @@ def _validate_parser(parser: dict[str, Any], path: str) -> dict[str, Any]:
         compiled["extract"] = _validate_extract(parser["extract"], f"{path}.extract")
 
     if "rat_detection" in parser:
-        compiled["rat_detection"] = parser["rat_detection"]
+        rd_path = f"{path}.rat_detection"
+        rd = parser["rat_detection"]
+        _require(isinstance(rd, dict), rd_path, "must be an object")
+        if "nr_codes_uppercase" in rd:
+            _require(
+                isinstance(rd["nr_codes_uppercase"], list)
+                and all(isinstance(x, str) and x for x in rd["nr_codes_uppercase"]),
+                f"{rd_path}.nr_codes_uppercase",
+                "must be a list of non-empty strings",
+            )
+        if "nr_text_tokens" in rd:
+            _require(
+                isinstance(rd["nr_text_tokens"], list)
+                and all(isinstance(x, str) and x for x in rd["nr_text_tokens"]),
+                f"{rd_path}.nr_text_tokens",
+                "must be a list of non-empty strings",
+            )
+        if "rat_nr" in rd:
+            _require(
+                isinstance(rd["rat_nr"], str) and rd["rat_nr"],
+                f"{rd_path}.rat_nr",
+                "must be a non-empty string",
+            )
+        if "rat_lte" in rd:
+            _require(
+                isinstance(rd["rat_lte"], str) and rd["rat_lte"],
+                f"{rd_path}.rat_lte",
+                "must be a non-empty string",
+            )
+        compiled["rat_detection"] = rd
     if "emit_event" in parser:
-        compiled["emit_event"] = parser["emit_event"]
+        ee_path = f"{path}.emit_event"
+        ee = parser["emit_event"]
+        _require(isinstance(ee, dict), ee_path, "must be an object")
+        if "summary_format" in ee:
+            _require(
+                isinstance(ee["summary_format"], str) and ee["summary_format"],
+                f"{ee_path}.summary_format",
+                "must be a non-empty string",
+            )
+        compiled["emit_event"] = ee
 
     return compiled
 
