@@ -1,6 +1,6 @@
 {
   "_schema_version": 1,
-  "_description": "External parser rules consumed by indexer.py. Move message codes, text markers, and regex patterns here so the agent can iterate on them without touching the indexer.",
+  "_description": "External parser rules consumed by indexer.py. Move message codes, text markers, and regex patterns here so the agent can iterate on them without touching the indexer. Canonical msg-code field is msg_codes_uppercase (upper-cased 0x-prefixed hex).",
 
   "block_header": {
     "_description": "Regex that recognises the start of a QXDM block. Group 1 = timestamp, 2 = sequence hex, 3 = msg code, 4 = msg type.",
@@ -13,7 +13,6 @@
       "_description": "5G MM / LTE EMM registration / reject causes and T3346/T3502 back-off timers.",
       "match": {
         "mode": "all",
-        "msg_codes": ["0xB80A", "0xB814"],
         "msg_codes_uppercase": ["0XB80A", "0XB814"],
         "text_token_regex": "(?:^|[^A-Z])5GMM[ _]CAUSE\\s*=(?:[^A-Z]|$)"
       },
@@ -41,7 +40,6 @@
       "_description": "LTE NAS EMM rejects (0xB0EC / 0xB0ED). Falls through nas_5gmm when 5GMM token is absent; kept explicit so LTE-only deployments stay clear.",
       "match": {
         "mode": "all",
-        "msg_codes": ["0xB0EC", "0xB0ED"],
         "msg_codes_uppercase": ["0XB0EC", "0XB0ED"],
         "text_token_regex": "(?:^|[^A-Z])EMM[ _]CAUSE\\s*=(?:[^A-Z]|$)"
       },
@@ -62,7 +60,6 @@
       "name": "nr_searcher",
       "_description": "NR5G ML1 Searcher / measurement (0xB97F). Parses the per-cell ASCII table and the key=value fallback form.",
       "match": {
-        "msg_codes": ["0xB97F"],
         "msg_codes_uppercase": ["0XB97F"],
         "text_tokens_any": ["NR5G ML1 SEARCHER"]
       },
@@ -107,6 +104,8 @@
       "name": "lte_rf",
       "_description": "LTE RF / NAS Signal Info (0x1544).",
       "match": {
+        "mode": "all",
+        "msg_codes_uppercase": ["0X1544"],
         "text_tokens_any": ["nas_sig_info", "lte_sig_info"]
       },
       "extract": {
@@ -132,10 +131,9 @@
 
     {
       "name": "rrc_event",
-      "_description": "Generic signaling / RRC event (0x1FFB / 0xB821 / 0xB0C0 or msg type starting with 'Event').",
+      "_description": "Generic signaling / RRC event (0x1FFB / 0xB821 / 0xB0C0).",
       "match": {
-        "msg_codes_uppercase": ["0X1FFB", "0XB821", "0XB0C0"],
-        "msg_type_contains": ["Event"]
+        "msg_codes_uppercase": ["0X1FFB", "0XB821", "0XB0C0"]
       },
       "extract": {
         "payload": {

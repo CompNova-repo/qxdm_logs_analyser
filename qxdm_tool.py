@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import sqlite3
 import sys
 from pathlib import Path
@@ -12,6 +13,30 @@ from typing import Any
 
 
 DEFAULT_DB_PATH = "qxdm_indexed.db"
+
+# Factored anomaly detection patterns — each entry documents which event it catches.
+# Using a named list makes LIKE overlap visible and lets the agent tune patterns
+# without deciphering a monolithic WHERE clause.
+ANOMALY_PATTERNS: list[tuple[str, str]] = [
+    # RRC Connection Release via Event DL_MSG
+    ("msg_type LIKE '%EVENT_LTE_RRC_DL_MSG%' AND summary LIKE '%Connection Release%'", "matches DL RRC Connection Release via EVENT_LTE_RRC_DL_MSG"),
+    # RRC State Change closing
+    ("msg_type LIKE '%EVENT_LTE_RRC_STATE_CHANGE%' AND summary LIKE '%Closing%'", "matches RRC state closing"),
+    # SCell teardown due to PCell RLF
+    ("msg_type LIKE '%EVENT_LTE_SCELL_STATE_CHANGE%' AND summary LIKE '%PCell RLF%'", "matches SCell teardown from PCell RLF"),
+    # MAC reset for connection release
+    ("msg_type LIKE '%EVENT_LTE_MAC_RESET%' AND summary LIKE '%Connection release%'", "matches MAC reset connection release"),
+    # Generic 3GPP release strings — kept distinct so overlap is explicit
+    ("msg_type LIKE '%RRCConnectionRelease%'", "matches 3GPP RRCConnectionRelease msg_type"),  # catches NR RRC release
+    ("msg_type LIKE '%RRC Release'", "matches RRC Release msg_type variant"),  # catches LTE RRC Release
+    ("summary LIKE '%DL_RRCConnectionRelease%'", "matches DL_RRCConnectionRelease in summary"),
+    ("summary LIKE '%STATUS FAILURE%'", "matches STATUS FAILURE"),
+    ("summary LIKE '%CONNECTION_RELEASE%'", "matches CONNECTION_RELEASE summary token"),
+]
+
+# Regex to surface releaseCause from raw_block without a second window query.
+_RELEASE_CAUSE_RE = re.compile(r"releaseCause\s*[:=]?\s*([^\s,;\)}]+)", re.IGNORECASE)
+
 
 
 def connect(db_path: str) -> sqlite3.Connection:
@@ -23,48 +48,46 @@ def connect(db_path: str) -> sqlite3.Connection:
     return sqlite3.connect(str(path))
 
 
-def query_anomalies(db_path: str) -> list[dict[str, Any]]:
-    """Scan for RRC releases, state changes, SCell teardowns, and RLFs."""
+def query_anomalies(db_path: str, include_cause: bool = False) -> list[dict[str, Any]]:
+    """Scan for RRC releases, state changes, SCell teardowns, and RLFs.
+
+    Patterns are defined in :data:`ANOMALY_PATTERNS` so overlap is explicit.
+    When ``include_cause`` is True (or always for convenience), ``releaseCause``
+    is extracted from ``raw_block`` via regex so callers do not need a second
+    ``window`` query to diagnose releases.
+    """
     conn = connect(db_path)
     cur = conn.cursor()
-    query = """
-        SELECT timestamp, sequence, msg_code, msg_type, summary
+    where_clause = " OR ".join(f"({pat})" for pat, _ in ANOMALY_PATTERNS)
+    query = f"""
+        SELECT timestamp, sequence, msg_code, msg_type, summary, raw_block
         FROM events
-        WHERE (
-            msg_type LIKE '%EVENT_LTE_RRC_DL_MSG%'
-            AND summary LIKE '%Connection Release%'
-        )
-           OR (
-            msg_type LIKE '%EVENT_LTE_RRC_STATE_CHANGE%'
-            AND summary LIKE '%Closing%'
-        )
-           OR (
-            msg_type LIKE '%EVENT_LTE_SCELL_STATE_CHANGE%'
-            AND summary LIKE '%PCell RLF%'
-        )
-           OR (
-            msg_type LIKE '%EVENT_LTE_MAC_RESET%'
-            AND summary LIKE '%Connection release%'
-        )
-           OR msg_type LIKE '%RRCConnectionRelease%'
-           OR msg_type LIKE '%RRC Release'
-           OR summary LIKE '%DL_RRCConnectionRelease%'
-           OR summary LIKE '%STATUS FAILURE%'
-           OR summary LIKE '%CONNECTION_RELEASE%'
+        WHERE {where_clause}
         ORDER BY sequence ASC
     """
     rows = cur.execute(query).fetchall()
     conn.close()
-    return [
-        {
-            "timestamp": row[0],
-            "sequence": row[1],
-            "msg_code": row[2],
-            "event": row[3],
-            "summary": row[4],
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        ts, seq, code, msg_type, summary, raw_block = row
+        entry: dict[str, Any] = {
+            "timestamp": ts,
+            "sequence": seq,
+            "msg_code": code,
+            "event": msg_type,
+            "summary": summary,
         }
-        for row in rows
-    ]
+        # Surface releaseCause inline — matches CLAUDE.md guidance to inspect IEs
+        # like releaseCause without a follow-up window call.
+        if raw_block:
+            m = _RELEASE_CAUSE_RE.search(raw_block)
+            if m:
+                entry["releaseCause"] = m.group(1).strip()
+            # Also surface raw_block snippet when include_cause requested for full IE inspection
+            if include_cause:
+                entry["raw_block"] = raw_block[:2000]
+        out.append(entry)
+    return out
 
 
 def get_rf_summary(db_path: str) -> dict[str, Any]:
@@ -202,6 +225,7 @@ def parser_health(db_path: str) -> dict[str, Any]:
         conn.close()
         return {
             "parsers": {},
+            "data": {},
             "warning": "parser_health table is missing — re-run indexer.py",
         }
     conn.close()
@@ -214,24 +238,24 @@ def parser_health(db_path: str) -> dict[str, Any]:
         }
         for row in rows
     }
-    return {"parsers": parsers}
+    return {"parsers": parsers, "data": parsers}
 
 
 def parser_failures(
     db_path: str,
     parser_name: str | None = None,
     limit: int = 10,
-) -> list[dict[str, Any]] | dict[str, Any]:
+) -> dict[str, Any]:
     """Return representative failure samples the indexer captured.
 
     If ``parser_name`` is ``None`` every parser with at least one failure is
-    included. Otherwise only that parser is queried.
+    included, returning up to ``limit`` samples *per parser* (not first-N
+    globally). Otherwise only that parser is queried.
 
-    Returns a list of failure dicts on the happy path. When the
-    ``parser_failures`` table is absent (e.g. before the first indexer run)
-    a uniform ``{"failures": [], "warning": "..."}`` envelope is returned
-    instead — the union return type documents this branch so callers
-    type-check it explicitly.
+    Always returns an envelope ``{"failures": [...], "data": [...], "warning": ...}``
+    so callers can handle all health commands uniformly. When the
+    ``parser_failures`` table is absent the envelope contains an empty list
+    plus a warning.
     """
     conn = connect(db_path)
     cur = conn.cursor()
@@ -244,19 +268,31 @@ def parser_failures(
                 (parser_name, limit),
             ).fetchall()
         else:
-            rows = cur.execute(
+            # Per-parser sampling: fetch all and slice per parser in Python to
+            # ensure later parsers are not starved by an early parser's rows.
+            all_rows = cur.execute(
                 "SELECT parser_name, msg_code, timestamp, failure_reason, sample_block "
-                "FROM parser_failures ORDER BY id ASC LIMIT ?",
-                (limit,),
+                "FROM parser_failures ORDER BY id ASC",
             ).fetchall()
+            # Group by parser and take first `limit` per group
+            from collections import defaultdict
+            grouped: dict[str, list] = defaultdict(list)
+            for r in all_rows:
+                if len(grouped[r[0]]) < limit:
+                    grouped[r[0]].append(r)
+            # Flatten in parser_name order for deterministic output
+            rows = []
+            for pname in sorted(grouped.keys()):
+                rows.extend(grouped[pname])
     except sqlite3.OperationalError:
         conn.close()
         return {
             "failures": [],
+            "data": [],
             "warning": "parser_failures table is missing — re-run indexer.py",
         }
     conn.close()
-    return [
+    failures = [
         {
             "parser": row[0],
             "msg_code": row[1],
@@ -266,6 +302,7 @@ def parser_failures(
         }
         for row in rows
     ]
+    return {"failures": failures, "data": failures}
 
 
 def parser_overlaps(db_path: str, limit: int = 20) -> dict[str, Any]:
@@ -279,15 +316,16 @@ def parser_overlaps(db_path: str, limit: int = 20) -> dict[str, Any]:
         ).fetchall()
     except sqlite3.OperationalError:
         conn.close()
-        return {"overlaps": [], "warning": "parser_overlaps table is missing — re-run indexer.py"}
+        return {"overlaps": [], "data": [], "warning": "parser_overlaps table is missing — re-run indexer.py"}
     conn.close()
-    return {"overlaps": [
+    overlaps = [
         {
             "timestamp": row[0], "msg_code": row[1], "selected_parser": row[2],
             "claiming_parsers": row[3].split(","), "sample_block": row[4],
         }
         for row in rows
-    ]}
+    ]
+    return {"overlaps": overlaps, "data": overlaps}
 
 
 def unknown_types(db_path: str, limit: int = 20) -> dict[str, Any]:
@@ -302,7 +340,7 @@ def unknown_types(db_path: str, limit: int = 20) -> dict[str, Any]:
         ).fetchall()
     except sqlite3.OperationalError:
         conn.close()
-        return {"unknown_msg_codes": [], "warning": "unknown_msg_codes table is missing"}
+        return {"unknown_msg_codes": [], "data": [], "warning": "unknown_msg_codes table is missing"}
 
     samples_table_missing = False
     out_codes = []
@@ -332,11 +370,14 @@ def unknown_types(db_path: str, limit: int = 20) -> dict[str, Any]:
             ],
         })
     conn.close()
-    envelope: dict[str, Any] = {"unknown_msg_codes": out_codes}
+    envelope: dict[str, Any] = {"unknown_msg_codes": out_codes, "data": out_codes}
     if samples_table_missing:
         envelope["warning"] = (
             "unknown_samples table is missing — sample details omitted"
         )
+    # Ensure generic envelope alias for uniform handling
+    if "warning" in envelope:
+        envelope["data"] = out_codes
     return envelope
 
 
@@ -351,7 +392,15 @@ def parse_args() -> argparse.Namespace:
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("anomalies", help="List likely teardown/failure events")
+    anomalies_parser = subparsers.add_parser("anomalies", help="List likely teardown/failure events")
+    anomalies_parser.add_argument(
+        "--with-cause", action="store_true",
+        help="Include raw_block and extracted releaseCause in anomalies output",
+    )
+    anomalies_parser.add_argument(
+        "--cause", type=str, default=None,
+        help="Filter anomalies to those whose releaseCause matches this value",
+    )
     subparsers.add_parser("rf-summary", help="Summarize RF KPIs")
 
     nas_parser = subparsers.add_parser(
@@ -429,7 +478,11 @@ def main() -> int:
     args = parse_args()
     try:
         if args.command == "anomalies":
-            print(json.dumps(query_anomalies(args.db), indent=2))
+            anomalies = query_anomalies(args.db, include_cause=getattr(args, "with_cause", False))
+            # Optional cause filtering
+            if getattr(args, "cause", None):
+                anomalies = [a for a in anomalies if a.get("releaseCause") == args.cause]
+            print(json.dumps(anomalies, indent=2))
         elif args.command == "rf-summary":
             print(json.dumps(get_rf_summary(args.db), indent=2))
         elif args.command == "nas":

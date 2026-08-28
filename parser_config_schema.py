@@ -39,6 +39,8 @@ _KNOWN_FLAGS = {
     "ASCII",
     "LOCALE",
 }
+# Known GPRS timer identifiers per 3GPP TS 24.008 / 24.301.
+_KNOWN_TIMERS = {"t3346", "t3502", "t3324", "t3412", "t3402", "t3411"}
 
 
 class ConfigValidationError(ValueError):
@@ -89,18 +91,36 @@ def _validate_extract(extract: dict[str, Any], path: str) -> dict[str, dict[str,
                 spec_path,
                 "'timers' must be a list of timer names",
             )
+            _require(
+                all(t in _KNOWN_TIMERS for t in spec),
+                spec_path,
+                f"unknown timer name (known: {sorted(_KNOWN_TIMERS)})",
+            )
             compiled[field] = {"spec": {"list": spec}}
             continue
         if field == "table_row":
             # table_row spec describes how to split the captured ASCII row;
             # it may carry nested column indexes and validation ranges that
-            # the Python side applies after the split. No top-level pattern.
+            # the Python side applies after the split. Pre-compile the row
+            # regex so the indexer doesn't recompile it per block.
             _require(
                 isinstance(spec, dict),
                 spec_path,
                 "'table_row' must be an object",
             )
-            compiled[field] = {"spec": spec}
+            _require(
+                "regex" in spec and isinstance(spec["regex"], str),
+                f"{spec_path}.regex",
+                "must be a string regex",
+            )
+            flags = spec.get("flags", []) or []
+            _require(
+                isinstance(flags, list) and all(isinstance(f, str) for f in flags),
+                f"{spec_path}.flags",
+                "'flags' must be a list of strings",
+            )
+            pattern = _compile_pattern(spec["regex"], flags, spec_path)
+            compiled[field] = {"pattern": pattern, "spec": spec}
             continue
         if field == "fallback_kv":
             _require(isinstance(spec, dict), spec_path, "must be an object")
@@ -156,7 +176,7 @@ def _validate_parser(parser: dict[str, Any], path: str) -> dict[str, Any]:
             "must be either 'any' or 'all'",
         )
 
-    def _validate_str_list(key: str) -> None:
+    def _validate_str_list(key: str, hex_check: bool = False) -> None:
         spec_path = f"{path}.match.{key}"
         _require(
             isinstance(match[key], list),
@@ -168,11 +188,17 @@ def _validate_parser(parser: dict[str, Any], path: str) -> dict[str, Any]:
             spec_path,
             "must be a list of non-empty strings",
         )
+        if hex_check:
+            _require(
+                all(re.fullmatch(r"0[xX][0-9A-Fa-f]+", item) for item in match[key]),
+                spec_path,
+                "items must be 0x-prefixed hex literals",
+            )
 
     if "msg_codes" in match:
-        _validate_str_list("msg_codes")
+        _validate_str_list("msg_codes", hex_check=True)
     if "msg_codes_uppercase" in match:
-        _validate_str_list("msg_codes_uppercase")
+        _validate_str_list("msg_codes_uppercase", hex_check=True)
     if "text_tokens_any" in match:
         _validate_str_list("text_tokens_any")
     if "text_token_regex" in match:
@@ -195,6 +221,27 @@ def _validate_parser(parser: dict[str, Any], path: str) -> dict[str, Any]:
             ) from exc
     if "msg_type_contains" in match:
         _validate_str_list("msg_type_contains")
+    if "msg_type_starts_with" in match:
+        _require(
+            isinstance(match["msg_type_starts_with"], str) and match["msg_type_starts_with"],
+            f"{path}.match.msg_type_starts_with",
+            "must be a non-empty string",
+        )
+    if "block_text_contains" in match:
+        _validate_str_list("block_text_contains")
+    if "msg_codes" in match or "msg_codes_uppercase" in match:
+        # Canonical form is msg_codes_uppercase. Normalize deprecated msg_codes
+        # into the uppercase field so the indexer only has to check one key.
+        if "msg_codes" in match and "msg_codes_uppercase" in match:
+            merged = sorted({c.upper() for c in match["msg_codes"]} | {c.upper() for c in match["msg_codes_uppercase"]})
+            match["msg_codes_uppercase"] = merged
+            del match["msg_codes"]
+        elif "msg_codes" in match:
+            match["msg_codes_uppercase"] = [c.upper() for c in match["msg_codes"]]
+            del match["msg_codes"]
+        else:
+            # Normalize existing uppercase entries to true upper-case.
+            match["msg_codes_uppercase"] = [c.upper() for c in match["msg_codes_uppercase"]]
 
     compiled: dict[str, Any] = {"name": parser["name"], "match": match, "extract": {}}
     if "extract" in parser:
@@ -216,6 +263,13 @@ def _validate_parser(parser: dict[str, Any], path: str) -> dict[str, Any]:
                 f"{rd_path}.nr_codes_uppercase",
                 "must be a list of non-empty strings",
             )
+            _require(
+                all(re.fullmatch(r"0[xX][0-9A-Fa-f]+", x) for x in rd["nr_codes_uppercase"]),
+                f"{rd_path}.nr_codes_uppercase",
+                "items must be 0x-prefixed hex literals",
+            )
+            # Normalize to upper-case for consistent matching.
+            rd["nr_codes_uppercase"] = [x.upper() for x in rd["nr_codes_uppercase"]]
         if "nr_text_tokens" in rd:
             _require(
                 isinstance(rd["nr_text_tokens"], list)
@@ -262,15 +316,22 @@ def validate_config(raw: dict[str, Any]) -> dict[str, Any]:
 
     compiled_parsers: dict[str, dict[str, Any]] = []
     seen_names: set[str] = set()
+    errors: list[str] = []
     for idx, parser in enumerate(raw["parsers"]):
-        compiled = _validate_parser(parser, f"$.parsers[{idx}]")
-        _require(
-            compiled["name"] not in seen_names,
-            f"$.parsers[{idx}].name",
-            f"duplicate parser name {compiled['name']!r}",
-        )
+        try:
+            compiled = _validate_parser(parser, f"$.parsers[{idx}]")
+            _require(
+                compiled["name"] not in seen_names,
+                f"$.parsers[{idx}].name",
+                f"duplicate parser name {compiled['name']!r}",
+            )
+        except ConfigValidationError as exc:
+            errors.append(str(exc))
+            continue
         seen_names.add(compiled["name"])
         compiled_parsers.append(compiled)
+    if errors:
+        raise ConfigValidationError("\n".join(errors))
 
     header = raw.get("block_header", {})
     _require(
@@ -318,7 +379,14 @@ if __name__ == "__main__":
     try:
         cfg = load_config(target)
     except ConfigValidationError as exc:
-        print(f"INVALID: {exc}", file=sys.stderr)
+        # Aggregate: show all collected errors separated by newlines.
+        msg = str(exc)
+        if "\n" in msg:
+            print(f"INVALID: {target} has {msg.count(chr(10))+1} error(s):", file=sys.stderr)
+            for line in msg.split("\n"):
+                print(f"  - {line}", file=sys.stderr)
+        else:
+            print(f"INVALID: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
     parser_names = ", ".join(p["name"] for p in cfg["parsers"])
     print(f"OK: {target} -> {len(cfg['parsers'])} parsers ({parser_names})")

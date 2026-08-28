@@ -77,12 +77,12 @@ def decode_gprs_timer2(block_text: str, name: str) -> int | None:
           unit = 1 (0x1)
           timer_2_value = 12 (0xc)
     """
-    incl = re.search(rf"{name}_incl\s*=\s*(\d+)", block_text)
+    incl = re.search(rf"{re.escape(name)}_incl\s*=\s*(\d+)", block_text)
     if incl and incl.group(1) == "0":
         return None
 
     sub = re.search(
-        rf"^\s*{name}\s*$(.{{0,400}}?)timer_2_value\s*=\s*(\d+)",
+        rf"^\s*{re.escape(name)}\s*$(.{{0,400}}?)timer_2_value\s*=\s*(\d+)",
         block_text,
         re.MULTILINE | re.DOTALL,
     )
@@ -94,7 +94,7 @@ def decode_gprs_timer2(block_text: str, name: str) -> int | None:
     unit = int(unit_match.group(1)) if unit_match else 0
 
     # TS 24.008 10.5.7.4 unit encoding for GPRS Timer 2.
-    multipliers = {0: 2, 1: 60, 2: 360}
+    multipliers = {0: 2, 1: 60, 2: 360, 3: 60, 4: 60, 5: 60, 6: 60}
     if unit == 7:  # timer deactivated
         return 0
     return value * multipliers.get(unit, 2)
@@ -179,6 +179,8 @@ def _record_failure(state: IndexerState, parser_name: str, msg_code: str,
                     timestamp: str, reason: str, block_text: str,
                     max_samples: int, max_block_chars: int) -> None:
     """Store a representative failed block for the agent to inspect."""
+    if timestamp is None:
+        return
     samples = state.failure_samples[parser_name]
     if len(samples) >= max_samples:
         return
@@ -187,9 +189,11 @@ def _record_failure(state: IndexerState, parser_name: str, msg_code: str,
     )
 
 
-def _record_unknown(state: IndexerState, msg_code: str, timestamp: str,
+def _record_unknown(state: IndexerState, msg_code: str, timestamp: str | None,
                     msg_type: str, block_text: str,
                     max_samples: int, max_block_chars: int) -> None:
+    if timestamp is None:
+        return
     state.unknown_msg_codes[msg_code] += 1
     samples = state.unknown_samples[msg_code]
     if len(samples) >= max_samples:
@@ -253,10 +257,7 @@ def _parse_nr_searcher(state: IndexerState, parser_cfg: dict[str, Any], ts: str,
     arfcn_fallback = extract["arfcn"]["spec"].get("fallback_value")
 
     table_spec = extract["table_row"]["spec"]
-    row_re = re.compile(
-        table_spec["regex"],
-        sum(getattr(re, f) for f in table_spec.get("flags", [])),
-    )
+    row_re = extract["table_row"]["pattern"]
     emitted = False
     rsrp_min = table_spec["validations"]["rsrp_min_dbm"]
     rsrp_max = table_spec["validations"]["rsrp_max_dbm"]
@@ -317,8 +318,8 @@ def _parse_lte_rf(state: IndexerState, parser_cfg: dict[str, Any], ts: str,
         return False
     rsrp_val = _safe_float(rsrp_m.group(1))
     rsrq_val = _safe_float(rsrq_m.group(1))
-    rssi_val = _safe_float(extract["rssi"]["pattern"].search(block_text).group(1)) \
-        if extract["rssi"]["pattern"].search(block_text) else None
+    rssi_match = extract["rssi"]["pattern"].search(block_text)
+    rssi_val = _safe_float(rssi_match.group(1)) if rssi_match else None
     snr_raw = extract["snr"]["pattern"].search(block_text)
     snr_val = _safe_float(snr_raw.group(1)) if snr_raw else None
     scale_thresh = extract["snr"]["spec"].get("scale_divide_by_10_when_abs_gt")
@@ -461,235 +462,255 @@ def parse_log(
     append: bool = False,
     config_path: str = DEFAULT_CONFIG_PATH,
     dry_run: bool = False,
+    quiet_overlaps: bool = False,
 ) -> dict[str, Any]:
     """Index ``file_path`` into ``db_path`` and return parser-health summary."""
     config = load_config(config_path)
+    # Validate log file exists early with a clear message (promote_config already does).
+    if not Path(file_path).is_file():
+        raise FileNotFoundError(f"log file not found: {file_path}")
     conn = init_db(db_path, append=append)
     cur = conn.cursor()
+    try:
+        start_seq = 0
+        if append:
+            row = cur.execute("SELECT MAX(sequence) FROM events").fetchone()
+            if row and row[0] is not None:
+                start_seq = row[0] + 1
 
-    start_seq = 0
-    if append:
-        row = cur.execute("SELECT MAX(sequence) FROM events").fetchone()
-        if row and row[0] is not None:
-            start_seq = row[0] + 1
+        seq_num = start_seq
+        current_ts = None
+        current_code = None
+        current_type = None
+        current_seq = None
+        current_block: list[str] = []
 
-    seq_num = start_seq
-    current_ts = None
-    current_code = None
-    current_type = None
-    current_seq = None
-    current_block: list[str] = []
+        state = IndexerState()
+        sampling = config.get("failure_sampling", {}) or {}
+        max_samples = int(sampling.get("max_samples_per_parser", 20))
+        max_unknown = int(sampling.get("max_samples_per_unknown_code", 10))
+        max_block_chars = int(sampling.get("max_block_size_chars", 4000))
+        validation = config.get("validation", {})
 
-    state = IndexerState()
-    sampling = config.get("failure_sampling", {}) or {}
-    max_samples = int(sampling.get("max_samples_per_parser", 20))
-    max_unknown = int(sampling.get("max_samples_per_unknown_code", 10))
-    max_block_chars = int(sampling.get("max_block_size_chars", 4000))
-    validation = config.get("validation", {})
+        def flush_block() -> None:
+            nonlocal current_block, current_ts, current_code, current_type, current_seq
+            if not current_block or not current_ts:
+                return
+            # Defensive guard: flush_block should never be called with None timestamps,
+            # but protect against future refactors that move header logic.
+            if current_ts is None or current_code is None:
+                return
+            block_text = "\n".join(current_block)
+            code_upper = str(current_code).upper()
+            block_upper = block_text.upper()
+            state.total_blocks += 1
 
-    def flush_block() -> None:
-        nonlocal current_block, current_ts, current_code, current_type, current_seq
-        if not current_block or not current_ts:
-            return
-        block_text = "\n".join(current_block)
-        code_upper = str(current_code).upper()
-        block_upper = block_text.upper()
-        state.total_blocks += 1
+            claiming_parsers = [
+                parser for parser in config["parsers"]
+                if _block_matches(parser, code_upper, current_type, block_upper, block_text)
+            ]
+            if len(claiming_parsers) > 1:
+                names = [parser["name"] for parser in claiming_parsers]
+                state.parser_overlaps.append((
+                    current_ts, current_code, names[0], ",".join(names),
+                    block_text[:max_block_chars],
+                ))
+                if not quiet_overlaps:
+                    # Limit per-line stderr noise: log first 20 overlaps in detail,
+                    # then suppress further lines and point to the persisted table.
+                    if len(state.parser_overlaps) <= 20:
+                        print(
+                            f"[!] Parser overlap at {current_ts} {current_code}: "
+                            f"{', '.join(names)}; selected {names[0]}",
+                            file=sys.stderr,
+                        )
+                    elif len(state.parser_overlaps) == 21:
+                        print(
+                            f"[!] ... {len(state.parser_overlaps)} parser overlaps detected, "
+                            f"suppressing further per-line logs (query parser_overlaps table for full detail)",
+                            file=sys.stderr,
+                        )
 
-        claiming_parsers = [
-            parser for parser in config["parsers"]
-            if _block_matches(parser, code_upper, current_type, block_upper, block_text)
-        ]
-        if len(claiming_parsers) > 1:
-            names = [parser["name"] for parser in claiming_parsers]
-            state.parser_overlaps.append((
-                current_ts, current_code, names[0], ",".join(names),
-                block_text[:max_block_chars],
-            ))
-            print(
-                f"[!] Parser overlap at {current_ts} {current_code}: "
-                f"{', '.join(names)}; selected {names[0]}",
-                file=sys.stderr,
+            matched_parser: str | None = None
+            for parser in claiming_parsers[:1]:
+                name = parser["name"]
+                state.stats[name].matched += 1
+                matched_parser = name
+                parsed_ok = False
+                failure_reason = ""
+                try:
+                    if name in ("nas_5gmm", "nas_lte"):
+                        parsed_ok = _parse_nas(
+                            state, parser, current_ts, current_seq,
+                            current_code, code_upper, current_type,
+                            block_text, block_upper,
+                        )
+                        if not parsed_ok:
+                            failure_reason = "cause regex missed"
+                    elif name == "nr_searcher":
+                        parsed_ok = _parse_nr_searcher(
+                            state, parser, current_ts, current_seq,
+                            current_code, current_type, block_text,
+                            validation, max_block_chars,
+                        )
+                        if not parsed_ok:
+                            failure_reason = "no per-cell rows and no key=value fallback"
+                    elif name == "lte_rf":
+                        parsed_ok = _parse_lte_rf(
+                            state, parser, current_ts, current_seq,
+                            current_code, current_type, block_text,
+                            validation,
+                        )
+                        if not parsed_ok:
+                            failure_reason = "missing rsrp/rsrq"
+                    elif name == "rrc_event":
+                        parsed_ok = _parse_rrc_event(
+                            state, parser, current_ts, current_seq,
+                            current_code, current_type, block_text,
+                        )
+                    elif name == "rrc_state":
+                        parsed_ok = _parse_rrc_state(
+                            state, current_ts, current_seq, current_code,
+                            current_type, block_text,
+                        )
+                except Exception as exc:  # noqa: BLE001 — agent needs to see the sample
+                    failure_reason = f"exception: {type(exc).__name__}: {exc}"
+                    parsed_ok = False
+
+                if parsed_ok:
+                    state.stats[name].parsed += 1
+                else:
+                    state.stats[name].failed += 1
+                    _record_failure(
+                        state, name, current_code, current_ts,
+                        failure_reason or "no extract produced",
+                        block_text, max_samples, max_block_chars,
+                    )
+                break
+
+            if matched_parser is None:
+                _record_unknown(state, code_upper, current_ts, current_type,
+                                block_text, max_unknown, max_block_chars)
+
+        print(
+            f"[*] Parsing log and building index: {file_path} -> {db_path}",
+            file=sys.stderr,
+        )
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            for line in f:
+                line_str = line.rstrip()
+                match = config["block_header_pattern"].match(line_str)
+                if match:
+                    flush_block()
+                    current_ts = match.group(1)
+                    current_code = match.group(3)
+                    current_type = match.group(4).strip()
+                    current_seq = seq_num
+                    seq_num += 1
+                    current_block = [line_str]
+                else:
+                    if current_block is not None:
+                        current_block.append(line_str)
+            flush_block()
+
+        if not dry_run:
+            cur.executemany(
+                "INSERT INTO events (timestamp, sequence, msg_code, subsys, msg_type, summary, raw_block) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                state.events,
+            )
+            cur.executemany(
+                "INSERT INTO nas_events (timestamp, sequence, rat, msg_id, cause_code, cause_str, t3346_timer, t3502_timer, raw_block) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                state.nas,
+            )
+            cur.executemany(
+                "INSERT INTO rf_kpis (timestamp, sequence, rat, arfcn, pci, rsrp, rsrq, rssi, snr) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                state.rf,
             )
 
-        matched_parser: str | None = None
-        for parser in claiming_parsers[:1]:
-            name = parser["name"]
-            state.stats[name].matched += 1
-            matched_parser = name
-            parsed_ok = False
-            failure_reason = ""
-            try:
-                if name in ("nas_5gmm", "nas_lte"):
-                    parsed_ok = _parse_nas(
-                        state, parser, current_ts, current_seq,
-                        current_code, code_upper, current_type,
-                        block_text, block_upper,
-                    )
-                    if not parsed_ok:
-                        failure_reason = "cause regex missed"
-                elif name == "nr_searcher":
-                    parsed_ok = _parse_nr_searcher(
-                        state, parser, current_ts, current_seq,
-                        current_code, current_type, block_text,
-                        validation, max_block_chars,
-                    )
-                    if not parsed_ok:
-                        failure_reason = "no per-cell rows and no key=value fallback"
-                elif name == "lte_rf":
-                    parsed_ok = _parse_lte_rf(
-                        state, parser, current_ts, current_seq,
-                        current_code, current_type, block_text,
-                        validation,
-                    )
-                    if not parsed_ok:
-                        failure_reason = "missing rsrp/rsrq"
-                elif name == "rrc_event":
-                    parsed_ok = _parse_rrc_event(
-                        state, parser, current_ts, current_seq,
-                        current_code, current_type, block_text,
-                    )
-                elif name == "rrc_state":
-                    parsed_ok = _parse_rrc_state(
-                        state, current_ts, current_seq, current_code,
-                        current_type, block_text,
-                    )
-            except Exception as exc:  # noqa: BLE001 — agent needs to see the sample
-                failure_reason = f"exception: {type(exc).__name__}: {exc}"
-                parsed_ok = False
-
-            if parsed_ok:
-                state.stats[name].parsed += 1
-            else:
-                state.stats[name].failed += 1
-                _record_failure(
-                    state, name, current_code, current_ts,
-                    failure_reason or "no extract produced",
-                    block_text, max_samples, max_block_chars,
-                )
-            break
-
-        if matched_parser is None:
-            _record_unknown(state, code_upper, current_ts, current_type,
-                            block_text, max_unknown, max_block_chars)
-
-    print(
-        f"[*] Parsing log and building index: {file_path} -> {db_path}",
-        file=sys.stderr,
-    )
-    with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            line_str = line.rstrip()
-            match = config["block_header_pattern"].match(line_str)
-            if match:
-                flush_block()
-                current_ts = match.group(1)
-                current_code = match.group(3)
-                current_type = match.group(4).strip()
-                current_seq = seq_num
-                seq_num += 1
-                current_block = [line_str]
-            else:
-                if current_block is not None:
-                    current_block.append(line_str)
-        flush_block()
-
-    if not dry_run:
-        cur.executemany(
-            "INSERT INTO events (timestamp, sequence, msg_code, subsys, msg_type, summary, raw_block) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?)",
-            state.events,
-        )
-        cur.executemany(
-            "INSERT INTO nas_events (timestamp, sequence, rat, msg_id, cause_code, cause_str, t3346_timer, t3502_timer, raw_block) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            state.nas,
-        )
-        cur.executemany(
-            "INSERT INTO rf_kpis (timestamp, sequence, rat, arfcn, pci, rsrp, rsrq, rssi, snr) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            state.rf,
-        )
-
-    # Parser-health tables are written even during dry-run so the agent can
-    # diff candidate vs. production health without re-running an indexer.
-    health_rows = [
-        (name, st.matched, st.parsed, st.failed, st.invalid_value)
-        for name, st in state.stats.items()
-    ]
-    if health_rows:
-        cur.executemany(
-            "INSERT INTO parser_health (parser_name, matched, parsed, failed, invalid_value) "
-            "VALUES (?, ?, ?, ?, ?)",
-            health_rows,
-        )
-
-    failure_rows: list[tuple] = []
-    for parser_name, samples in state.failure_samples.items():
-        for msg_code, ts, reason, sample in samples:
-            failure_rows.append((parser_name, msg_code, ts, reason, sample))
-    if failure_rows:
-        cur.executemany(
-            "INSERT INTO parser_failures (parser_name, msg_code, timestamp, failure_reason, sample_block) "
-            "VALUES (?, ?, ?, ?, ?)",
-            failure_rows,
-        )
-
-    unknown_rows = [
-        (code, occ, len(state.unknown_samples[code]))
-        for code, occ in state.unknown_msg_codes.items()
-    ]
-    if unknown_rows:
-        cur.executemany(
-            "INSERT INTO unknown_msg_codes (msg_code, occurrences, sample_count) "
-            "VALUES (?, ?, ?)",
-            unknown_rows,
-        )
-
-    unknown_sample_rows: list[tuple] = []
-    for code, samples in state.unknown_samples.items():
-        for ts, msg_type, sample in samples:
-            unknown_sample_rows.append((code, ts, msg_type, sample))
-    if unknown_sample_rows:
-        cur.executemany(
-            "INSERT INTO unknown_samples (msg_code, timestamp, msg_type, sample_block) "
-            "VALUES (?, ?, ?, ?)",
-            unknown_sample_rows,
-        )
-
-    if state.parser_overlaps:
-        cur.executemany(
-            "INSERT INTO parser_overlaps "
-            "(timestamp, msg_code, selected_parser, claiming_parsers, sample_block) "
-            "VALUES (?, ?, ?, ?, ?)",
-            state.parser_overlaps,
-        )
-
-    conn.commit()
-    conn.close()
-
-    health = {
-        "total_blocks": state.total_blocks,
-        "parsers": {
-            name: {
-                "matched": st.matched,
-                "parsed": st.parsed,
-                "failed": st.failed,
-                "invalid_value": st.invalid_value,
-            }
+        # Parser-health tables are written even during dry-run so the agent can
+        # diff candidate vs. production health without re-running an indexer.
+        health_rows = [
+            (name, st.matched, st.parsed, st.failed, st.invalid_value)
             for name, st in state.stats.items()
-        },
-        "unknown_msg_codes": dict(state.unknown_msg_codes),
-        "parser_overlaps": len(state.parser_overlaps),
-    }
-    print(
-        f"[✓] Indexed {len(state.events)} Events, {len(state.nas)} NAS Records, "
-        f"and {len(state.rf)} RF Measurements. "
-        f"({state.total_blocks} blocks scanned, dry_run={dry_run})",
-        file=sys.stderr,
-    )
-    return health
+        ]
+        if health_rows:
+            cur.executemany(
+                "INSERT INTO parser_health (parser_name, matched, parsed, failed, invalid_value) "
+                "VALUES (?, ?, ?, ?, ?)",
+                health_rows,
+            )
 
+        failure_rows: list[tuple] = []
+        for parser_name, samples in state.failure_samples.items():
+            for msg_code, ts, reason, sample in samples:
+                failure_rows.append((parser_name, msg_code, ts, reason, sample))
+        if failure_rows:
+            cur.executemany(
+                "INSERT INTO parser_failures (parser_name, msg_code, timestamp, failure_reason, sample_block) "
+                "VALUES (?, ?, ?, ?, ?)",
+                failure_rows,
+            )
+
+        unknown_rows = [
+            (code, occ, len(state.unknown_samples[code]))
+            for code, occ in state.unknown_msg_codes.items()
+        ]
+        if unknown_rows:
+            cur.executemany(
+                "INSERT INTO unknown_msg_codes (msg_code, occurrences, sample_count) "
+                "VALUES (?, ?, ?)",
+                unknown_rows,
+            )
+
+        unknown_sample_rows: list[tuple] = []
+        for code, samples in state.unknown_samples.items():
+            for ts, msg_type, sample in samples:
+                unknown_sample_rows.append((code, ts, msg_type, sample))
+        if unknown_sample_rows:
+            cur.executemany(
+                "INSERT INTO unknown_samples (msg_code, timestamp, msg_type, sample_block) "
+                "VALUES (?, ?, ?, ?)",
+                unknown_sample_rows,
+            )
+
+        if state.parser_overlaps:
+            cur.executemany(
+                "INSERT INTO parser_overlaps "
+                "(timestamp, msg_code, selected_parser, claiming_parsers, sample_block) "
+                "VALUES (?, ?, ?, ?, ?)",
+                state.parser_overlaps,
+            )
+
+        conn.commit()
+        health = {
+            "total_blocks": state.total_blocks,
+            "parsers": {
+                name: {
+                    "matched": st.matched,
+                    "parsed": st.parsed,
+                    "failed": st.failed,
+                    "invalid_value": st.invalid_value,
+                }
+                for name, st in state.stats.items()
+            },
+            "unknown_msg_codes": dict(state.unknown_msg_codes),
+            "parser_overlaps": len(state.parser_overlaps),
+        }
+        print(
+            f"[✓] Indexed {len(state.events)} Events, {len(state.nas)} NAS Records, "
+            f"and {len(state.rf)} RF Measurements. "
+            f"({state.total_blocks} blocks scanned, dry_run={dry_run})",
+            file=sys.stderr,
+        )
+        return health
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 def diff_health(
     before: dict[str, dict[str, int]],
@@ -766,8 +787,15 @@ if __name__ == "__main__":
         help="After indexing, copy --config to parser_config.json "
              "(use after --dry-run has confirmed the candidate)",
     )
+    parser.add_argument(
+        "--quiet-overlaps", action="store_true",
+        help="Suppress per-block parser-overlap stderr messages (overlaps still recorded in parser_overlaps table)",
+    )
 
     args = parser.parse_args()
+
+    if not Path(args.log_file).is_file():
+        parser.error(f"log file not found: {args.log_file}")
 
     # Guard against the dry-run footgun: a user who runs ``indexer.py <log>
     # --dry-run`` is probably not aware that ``qxdm_indexed.db`` is the
@@ -791,9 +819,13 @@ if __name__ == "__main__":
         health = parse_log(
             args.log_file, db_path=db_path, append=args.append,
             config_path=args.config, dry_run=args.dry_run,
+            quiet_overlaps=args.quiet_overlaps,
         )
     except ConfigValidationError as exc:
         print(f"error: invalid parser config ({args.config}): {exc}", file=sys.stderr)
+        raise SystemExit(2) from exc
+    except FileNotFoundError as exc:
+        print(f"error: {exc}", file=sys.stderr)
         raise SystemExit(2) from exc
 
     if args.promote:
