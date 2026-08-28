@@ -189,6 +189,106 @@ def query_nas(db_path: str, all_events: bool = False) -> list[dict[str, Any]]:
     ]
 
 
+def parser_health(db_path: str) -> dict[str, Any]:
+    """Summarise parser match/parse/fail counts from the last indexer run."""
+    conn = connect(db_path)
+    cur = conn.cursor()
+    try:
+        rows = cur.execute(
+            "SELECT parser_name, matched, parsed, failed, invalid_value "
+            "FROM parser_health ORDER BY parser_name ASC"
+        ).fetchall()
+    except sqlite3.OperationalError:
+        conn.close()
+        return {
+            "parsers": {},
+            "warning": "parser_health table is missing — re-run indexer.py",
+        }
+    conn.close()
+    parsers = {
+        row[0]: {
+            "matched": row[1],
+            "parsed": row[2],
+            "failed": row[3],
+            "invalid_value": row[4],
+        }
+        for row in rows
+    }
+    return {"parsers": parsers}
+
+
+def parser_failures(
+    db_path: str,
+    parser_name: str | None = None,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Return representative failure samples the indexer captured.
+
+    If ``parser_name`` is ``None`` every parser with at least one failure is
+    included. Otherwise only that parser is queried.
+    """
+    conn = connect(db_path)
+    cur = conn.cursor()
+    if parser_name:
+        rows = cur.execute(
+            "SELECT parser_name, msg_code, timestamp, failure_reason, sample_block "
+            "FROM parser_failures WHERE parser_name = ? "
+            "ORDER BY id ASC LIMIT ?",
+            (parser_name, limit),
+        ).fetchall()
+    else:
+        rows = cur.execute(
+            "SELECT parser_name, msg_code, timestamp, failure_reason, sample_block "
+            "FROM parser_failures ORDER BY id ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    conn.close()
+    return [
+        {
+            "parser": row[0],
+            "msg_code": row[1],
+            "timestamp": row[2],
+            "failure_reason": row[3],
+            "sample_block": row[4],
+        }
+        for row in rows
+    ]
+
+
+def unknown_types(db_path: str, limit: int = 20) -> dict[str, Any]:
+    """List message codes the indexer did not match, plus a few samples each."""
+    conn = connect(db_path)
+    cur = conn.cursor()
+    try:
+        code_rows = cur.execute(
+            "SELECT msg_code, occurrences, sample_count "
+            "FROM unknown_msg_codes ORDER BY occurrences DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        conn.close()
+        return {"unknown_msg_codes": [], "warning": "unknown_msg_codes table is missing"}
+
+    out_codes = []
+    for code, occ, sample_count in code_rows:
+        samples = cur.execute(
+            "SELECT timestamp, msg_type, sample_block FROM unknown_samples "
+            "WHERE msg_code = ? ORDER BY id ASC LIMIT 3",
+            (code,),
+        ).fetchall()
+        out_codes.append({
+            "msg_code": code,
+            "occurrences": occ,
+            "sample_count": sample_count,
+            "samples": [
+                {"timestamp": s[0], "msg_type": s[1], "sample_block": s[2]}
+                for s in samples
+            ],
+        })
+    conn.close()
+    return {"unknown_msg_codes": out_codes}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Query a SQLite index produced by indexer.py."
@@ -233,6 +333,38 @@ def parse_args() -> argparse.Namespace:
         help="Maximum events to print, default: 50",
     )
 
+    health_parser = subparsers.add_parser(
+        "parser-health",
+        help="Summarise match/parse/fail counts for every parser in the last indexer run",
+    )
+
+    failures_parser = subparsers.add_parser(
+        "parser-failures",
+        help="Print representative failed blocks for a parser (default: every parser)",
+    )
+    failures_parser.add_argument(
+        "parser_name",
+        nargs="?",
+        help="Optional parser name to filter on, e.g. nr_searcher",
+    )
+    failures_parser.add_argument(
+        "--limit",
+        type=int,
+        default=10,
+        help="Maximum samples to print, default: 10",
+    )
+
+    unknown_parser = subparsers.add_parser(
+        "unknown-types",
+        help="List message codes that no parser claimed, with a few samples each",
+    )
+    unknown_parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum distinct unknown codes to print, default: 20",
+    )
+
     return parser.parse_args()
 
 
@@ -249,6 +381,15 @@ def main() -> int:
             print(get_context_window(args.db, args.timestamp, args.count))
         elif args.command == "events":
             print(json.dumps(list_events(args.db, args.limit), indent=2))
+        elif args.command == "parser-health":
+            print(json.dumps(parser_health(args.db), indent=2))
+        elif args.command == "parser-failures":
+            print(json.dumps(
+                parser_failures(args.db, args.parser_name, args.limit),
+                indent=2,
+            ))
+        elif args.command == "unknown-types":
+            print(json.dumps(unknown_types(args.db, args.limit), indent=2))
         return 0
     except (FileNotFoundError, sqlite3.Error) as exc:
         print(f"error: {exc}", file=sys.stderr)

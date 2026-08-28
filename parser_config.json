@@ -1,0 +1,183 @@
+{
+  "_schema_version": 1,
+  "_description": "External parser rules consumed by indexer.py. Move message codes, text markers, and regex patterns here so the agent can iterate on them without touching the indexer.",
+
+  "block_header": {
+    "_description": "Regex that recognises the start of a QXDM block. Group 1 = timestamp, 2 = sequence hex, 3 = msg code, 4 = msg type.",
+    "pattern": "^(\\d{4} \\w{3} \\s*\\d{1,2}\\s+\\d{2}:\\d{2}:\\d{2}\\.\\d{3})\\s+\\[([0-9A-Fa-f]+)\\]\\s+(0x[0-9A-Fa-f]+)\\s+(.+)$"
+  },
+
+  "parsers": [
+    {
+      "name": "nas_5gmm",
+      "_description": "5G MM / LTE EMM registration / reject causes and T3346/T3502 back-off timers.",
+      "match": {
+        "msg_codes": ["0xB80A", "0xB814"],
+        "msg_codes_uppercase": ["0XB80A", "0XB814"],
+        "text_token_regex": "(?:^|[^A-Z])(5GMM)(?:[^A-Z]|$)"
+      },
+      "rat_detection": {
+        "nr_codes_uppercase": ["0XB80A", "0XB814"],
+        "nr_text_tokens": ["5GMM", "NR5G"],
+        "rat_nr": "5GNR",
+        "rat_lte": "LTE"
+      },
+      "extract": {
+        "cause": {
+          "regex": "(?:_5gmm_cause|emm_cause|cause_val)\\s*=\\s*(\\d+)(?:\\s*\\(0[xX][0-9A-Fa-f]+\\))?(?:\\s*\\(([^)]*)\\))?",
+          "flags": ["IGNORECASE"],
+          "fallback_cause_str": "UNKNOWN"
+        },
+        "timers": ["t3346", "t3502"]
+      },
+      "emit_event": {
+        "summary_format": "NAS [{rat}] Cause={cause_str}"
+      }
+    },
+
+    {
+      "name": "nas_lte",
+      "_description": "LTE NAS EMM rejects (0xB0EC / 0xB0ED). Falls through nas_5gmm when 5GMM token is absent; kept explicit so LTE-only deployments stay clear.",
+      "match": {
+        "msg_codes": ["0xB0EC", "0xB0ED"],
+        "msg_codes_uppercase": ["0XB0EC", "0XB0ED"],
+        "text_token_regex": "(?:^|[^A-Z])(EMM)(?:[^A-Z]|$)"
+      },
+      "extract": {
+        "cause": {
+          "regex": "(?:_5gmm_cause|emm_cause|cause_val)\\s*=\\s*(\\d+)(?:\\s*\\(0[xX][0-9A-Fa-f]+\\))?(?:\\s*\\(([^)]*)\\))?",
+          "flags": ["IGNORECASE"],
+          "fallback_cause_str": "UNKNOWN"
+        },
+        "timers": ["t3346", "t3502"]
+      },
+      "emit_event": {
+        "summary_format": "NAS [{rat}] Cause={cause_str}"
+      }
+    },
+
+    {
+      "name": "nr_searcher",
+      "_description": "NR5G ML1 Searcher / measurement (0xB97F). Parses the per-cell ASCII table and the key=value fallback form.",
+      "match": {
+        "msg_codes": ["0xB97F"],
+        "msg_codes_uppercase": ["0XB97F"],
+        "text_tokens_any": ["NR5G ML1 SEARCHER"]
+      },
+      "extract": {
+        "arfcn": {
+          "regex": "(?:Raster\\s+ARFCN|arfcn|carrier_freq)\\s*=\\s*(\\d+)",
+          "flags": ["IGNORECASE"],
+          "fallback_value": 126490
+        },
+        "table_row": {
+          "regex": "^\\s*\\|\\s*\\d+\\|.*$",
+          "flags": ["MULTILINE"],
+          "split_on": "|",
+          "column_indexes": {
+            "pci": 2,
+            "rsrp": 5,
+            "rsrq": 6
+          },
+          "validations": {
+            "rsrp_min_dbm": -156.0,
+            "rsrp_max_dbm": -31.0
+          }
+        },
+        "fallback_kv": {
+          "rsrp": {
+            "regex": "(?:ss_rsrp|rsrp)\\s*=\\s*(-?\\d+(?:\\.\\d+)?)",
+            "flags": ["IGNORECASE"]
+          },
+          "rsrq": {
+            "regex": "(?:ss_rsrq|rsrq)\\s*=\\s*(-?\\d+(?:\\.\\d+)?)",
+            "flags": ["IGNORECASE"]
+          },
+          "pci": {
+            "regex": "pci\\s*=\\s*(\\d+)",
+            "flags": ["IGNORECASE"]
+          }
+        }
+      }
+    },
+
+    {
+      "name": "lte_rf",
+      "_description": "LTE RF / NAS Signal Info (0x1544).",
+      "match": {
+        "text_tokens_any": ["nas_sig_info", "lte_sig_info"]
+      },
+      "extract": {
+        "rsrp": {
+          "regex": "rsrp\\s*=\\s*(-?\\d+(?:\\.\\d+)?)",
+          "flags": []
+        },
+        "rsrq": {
+          "regex": "rsrq\\s*=\\s*(-?\\d+(?:\\.\\d+)?)",
+          "flags": []
+        },
+        "rssi": {
+          "regex": "rssi\\s*=\\s*(-?\\d+(?:\\.\\d+)?)",
+          "flags": []
+        },
+        "snr": {
+          "regex": "snr\\s*=\\s*(-?\\d+(?:\\.\\d+)?)",
+          "flags": [],
+          "scale_divide_by_10_when_abs_gt": 100
+        }
+      }
+    },
+
+    {
+      "name": "rrc_event",
+      "_description": "Generic signaling / RRC event (0x1FFB / 0xB821 / 0xB0C0 or msg type starting with 'Event').",
+      "match": {
+        "msg_codes_uppercase": ["0X1FFB", "0XB821", "0XB0C0"],
+        "msg_type_contains": ["Event"]
+      },
+      "extract": {
+        "payload": {
+          "regex": "Payload String = (.*)",
+          "flags": []
+        }
+      }
+    },
+
+    {
+      "name": "rrc_state",
+      "_description": "Fallback for CM State Info / RRC blocks that don't match a more specific parser.",
+      "match": {
+        "msg_type_contains": ["CM State Info"],
+        "block_text_contains": ["RRC"]
+      },
+      "extract": {}
+    }
+  ],
+
+  "validation": {
+    "_description": "Sanity bounds enforced after parsing. Anything out of range is dropped and counted as an invalid KPI.",
+    "rf": {
+      "rsrp_min_dbm": -156.0,
+      "rsrp_max_dbm": -31.0,
+      "rsrq_min_db": -30.0,
+      "rsrq_max_db": 10.0,
+      "rssi_min_dbm": -140.0,
+      "rssi_max_dbm": 0.0,
+      "snr_min_db": -20.0,
+      "snr_max_db": 60.0
+    },
+    "nas": {
+      "cause_code_min": 0,
+      "cause_code_max": 255,
+      "t3346_timer_max_sec": 7200,
+      "t3502_timer_max_sec": 7200
+    }
+  },
+
+  "failure_sampling": {
+    "_description": "How many failed/unknown blocks to retain per parser for the agent to inspect.",
+    "max_samples_per_parser": 20,
+    "max_samples_per_unknown_code": 10,
+    "max_block_size_chars": 4000
+  }
+}
