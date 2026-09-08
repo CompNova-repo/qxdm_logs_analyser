@@ -9,7 +9,8 @@ The agent's loop looks like::
     3. ``promote_config.py validate <log> --candidate parser_config.candidate.json``
        -> dry-run the candidate and diff health against the production DB.
     4. If the diff looks healthy, ``promote_config.py promote --candidate ...``
-       -> ``shutil.copyfile`` over ``parser_config.json``.
+       -> atomic replace over ``parser_config.json`` (tempfile +
+       ``os.replace``; see ``parser_config_schema.atomic_write_text``).
 
 This script is deliberately small. It exists so the agent doesn't have to
 memorise the indexer CLI surface.
@@ -25,7 +26,7 @@ import sys
 from pathlib import Path
 
 import indexer
-from parser_config_schema import ConfigValidationError, load_config
+from parser_config_schema import ConfigValidationError, atomic_write_text, load_config
 
 
 def _read_health(db_path: str) -> dict[str, dict[str, int]]:
@@ -151,7 +152,10 @@ def cmd_promote(args: argparse.Namespace) -> int:
         # the same path (e.g. typos in --candidate / --target).
         print(f"[=] Candidate and target are the same file ({src}); nothing to do.")
         return 0
-    shutil.copyfile(src, dst)
+    # Atomic replace: write to a temp file in dst's directory, then
+    # os.replace over dst. Avoids truncating parser_config.json if the
+    # process is interrupted (Ctrl-C, ENOSPC) mid-copy.
+    atomic_write_text(dst, Path(args.candidate).read_bytes())
     print(f"[✓] Promoted {src} -> {dst}", file=sys.stderr)
     return 0
 

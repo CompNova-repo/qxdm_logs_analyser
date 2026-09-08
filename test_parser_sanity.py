@@ -15,6 +15,7 @@ from __future__ import annotations
 import os
 import sqlite3
 import sys
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -154,6 +155,41 @@ def test_unknown_samples_match_unknown_codes() -> None:
         f"{orphan_samples} unknown_samples rows reference no unknown_msg_codes "
         "row — sample/code tables are out of sync"
     )
+
+
+def test_atomic_write_text_replaces_and_cleans_up() -> None:
+    """``atomic_write_text`` must replace the destination with the new
+    content and leave no temp file behind."""
+    from parser_config_schema import atomic_write_text
+
+    with tempfile.TemporaryDirectory() as td:
+        dst = Path(td) / "parser_config.json"
+        dst.write_text("OLD content that should be replaced")
+        atomic_write_text(dst, "NEW content")
+        assert dst.read_text() == "NEW content"
+        leftover = list(Path(td).glob("*.tmp"))
+        assert not leftover, f"leftover temp files: {leftover}"
+
+
+def test_atomic_write_text_accepts_bytes() -> None:
+    """``atomic_write_text`` accepts ``bytes`` content as well as ``str``."""
+    from parser_config_schema import atomic_write_text
+
+    with tempfile.TemporaryDirectory() as td:
+        dst = Path(td) / "binary_blob.bin"
+        atomic_write_text(dst, b"\x00\x01\x02\xff")
+        assert dst.read_bytes() == b"\x00\x01\x02\xff"
+
+
+def test_atomic_write_text_creates_missing_parent_dirs() -> None:
+    """``atomic_write_text`` should create parent directories as needed
+    (the temp file is created in dst's parent, so the parent must exist)."""
+    from parser_config_schema import atomic_write_text
+
+    with tempfile.TemporaryDirectory() as td:
+        nested = Path(td) / "a" / "b" / "c" / "out.json"
+        atomic_write_text(nested, '{"ok": true}')
+        assert nested.read_text() == '{"ok": true}'
 
 
 # ---------------------------------------------------------------------------

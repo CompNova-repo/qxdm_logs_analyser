@@ -31,7 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from parser_config_schema import ConfigValidationError, load_config
+from parser_config_schema import ConfigValidationError, atomic_write_text, load_config
 
 DEFAULT_CONFIG_PATH = "parser_config.json"
 
@@ -756,7 +756,10 @@ def promote_candidate(candidate_path: str, target_path: str = DEFAULT_CONFIG_PAT
     # Validate before swapping so we don't leave the indexer pointing at a
     # broken config.
     load_config(src)
-    shutil.copyfile(src, dst)
+    # Atomic replace: write to a temp file in dst's directory, then
+    # os.replace over dst. Avoids truncating parser_config.json if the
+    # process is interrupted (Ctrl-C, ENOSPC) mid-copy.
+    atomic_write_text(dst, Path(src).read_bytes())
     print(f"[✓] Promoted {src} → {dst}", file=sys.stderr)
 
 

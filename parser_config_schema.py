@@ -372,6 +372,46 @@ def load_config(path: str | Path) -> dict[str, Any]:
     return validate_config(raw)
 
 
+def atomic_write_text(dst: str | Path, content: str | bytes) -> None:
+    """Replace ``dst`` with ``content`` atomically.
+
+    Writes ``content`` to a temporary file in ``dst``'s directory, fsyncs
+    it, then atomically renames it over ``dst`` via ``os.replace``. On
+    POSIX this is a single rename syscall and is atomic; on Windows
+    ``os.replace`` is atomic on the same volume since Python 3.3.
+
+    ``shutil.copyfile`` truncates the destination before writing, so an
+    interrupted copy leaves the target empty. ``os.replace`` over a
+    fully-written temp file avoids that — readers always see either the
+    old content or the new content, never a partial write.
+    """
+    import os
+    import tempfile
+
+    dst_path = Path(dst)
+    if isinstance(content, str):
+        payload = content.encode("utf-8")
+    else:
+        payload = content
+
+    dst_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        dir=dst_path.parent, prefix=dst_path.name + ".", suffix=".tmp"
+    )
+    try:
+        with os.fdopen(fd, "wb") as tmp:
+            tmp.write(payload)
+            tmp.flush()
+            os.fsync(tmp.fileno())
+        os.replace(tmp_name, dst_path)
+    except Exception:
+        try:
+            os.unlink(tmp_name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
 if __name__ == "__main__":
     import sys
 
