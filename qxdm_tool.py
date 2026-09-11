@@ -48,24 +48,34 @@ def connect(db_path: str) -> sqlite3.Connection:
     return sqlite3.connect(str(path))
 
 
-def query_anomalies(db_path: str, include_cause: bool = False) -> list[dict[str, Any]]:
+def query_anomalies(
+    db_path: str, include_cause: bool = False,
+    test_id: str | None = None,
+) -> list[dict[str, Any]]:
     """Scan for RRC releases, state changes, SCell teardowns, and RLFs.
 
     Patterns are defined in :data:`ANOMALY_PATTERNS` so overlap is explicit.
     When ``include_cause`` is True (or always for convenience), ``releaseCause``
     is extracted from ``raw_block`` via regex so callers do not need a second
-    ``window`` query to diagnose releases.
+    ``window`` query to diagnose releases. When ``test_id`` is supplied,
+    results are restricted to that single logical test run.
     """
     conn = connect(db_path)
     cur = conn.cursor()
     where_clause = " OR ".join(f"({pat})" for pat, _ in ANOMALY_PATTERNS)
+    clauses = [where_clause]
+    params: list[Any] = []
+    if test_id:
+        clauses.append("test_id = ?")
+        params.append(test_id)
+    full_where = " AND ".join(f"({c})" for c in clauses)
     query = f"""
         SELECT timestamp, sequence, msg_code, msg_type, summary, raw_block
         FROM events
-        WHERE {where_clause}
+        WHERE {full_where}
         ORDER BY sequence ASC
     """
-    rows = cur.execute(query).fetchall()
+    rows = cur.execute(query, params).fetchall()
     conn.close()
     out: list[dict[str, Any]] = []
     for row in rows:
@@ -90,11 +100,20 @@ def query_anomalies(db_path: str, include_cause: bool = False) -> list[dict[str,
     return out
 
 
-def get_rf_summary(db_path: str) -> dict[str, Any]:
-    """Calculate min, max, and average for RF KPIs."""
+def get_rf_summary(db_path: str, test_id: str | None = None) -> dict[str, Any]:
+    """Calculate min, max, and average for RF KPIs.
+
+    When ``test_id`` is supplied, results are scoped to that logical test
+    run; otherwise the aggregation spans every indexed run in the DB.
+    """
     conn = connect(db_path)
     cur = conn.cursor()
-    query = """
+    params: list[Any] = []
+    where = ""
+    if test_id:
+        where = " WHERE test_id = ?"
+        params.append(test_id)
+    query = f"""
         SELECT
             COUNT(*),
             AVG(rsrp), MIN(rsrp), MAX(rsrp),
@@ -102,14 +121,16 @@ def get_rf_summary(db_path: str) -> dict[str, Any]:
             AVG(rssi), MIN(rssi), MAX(rssi),
             AVG(snr), MIN(snr), MAX(snr)
         FROM rf_kpis
+        {where}
     """
-    row = cur.execute(query).fetchone()
+    row = cur.execute(query, params).fetchone()
     conn.close()
 
     if not row or row[0] == 0:
-        return {"status": "No RF metrics found"}
+        return {"status": "No RF metrics found", "test_id": test_id}
 
     return {
+        "test_id": test_id,
         "records": row[0],
         "avg_rsrp_dbm": round(row[1], 2) if row[1] is not None else None,
         "min_rsrp_dbm": row[2],
@@ -126,19 +147,32 @@ def get_rf_summary(db_path: str) -> dict[str, Any]:
     }
 
 
-def get_context_window(db_path: str, timestamp: str, window_count: int = 5) -> str:
-    """Retrieve raw signaling blocks before and after an event timestamp."""
+def get_context_window(
+    db_path: str, timestamp: str, window_count: int = 5,
+    test_id: str | None = None,
+) -> str:
+    """Retrieve raw signaling blocks before and after an event timestamp.
+
+    Slices across chunk boundaries if ``test_id`` spans multiple files
+    because the global ``sequence`` column already bridges chunk seams.
+    """
     conn = connect(db_path)
     cur = conn.cursor()
+    clauses = ["timestamp <= ?"]
+    params: list[Any] = [timestamp]
+    if test_id:
+        clauses.append("test_id = ?")
+        params.append(test_id)
+    where = " AND ".join(f"({c})" for c in clauses)
     target = cur.execute(
-        """
+        f"""
         SELECT sequence
         FROM events
-        WHERE timestamp <= ?
+        WHERE {where}
         ORDER BY timestamp DESC, sequence ASC
         LIMIT 1
         """,
-        (timestamp,),
+        params,
     ).fetchone()
 
     if not target:
@@ -146,31 +180,52 @@ def get_context_window(db_path: str, timestamp: str, window_count: int = 5) -> s
         return f"No indexed event found at or before timestamp: {timestamp}"
 
     target_sequence = target[0]
+    slice_clauses = ["sequence BETWEEN ? AND ?"]
+    slice_params: list[Any] = [target_sequence - window_count, target_sequence + window_count]
+    if test_id:
+        slice_clauses.append("test_id = ?")
+        slice_params.append(test_id)
+    slice_where = " AND ".join(f"({c})" for c in slice_clauses)
     rows = cur.execute(
-        """
-        SELECT timestamp, msg_type, raw_block
+        f"""
+        SELECT timestamp, msg_type, raw_block, source_file
         FROM events
-        WHERE sequence BETWEEN ? AND ?
+        WHERE {slice_where}
         ORDER BY sequence ASC
         """,
-        (target_sequence - window_count, target_sequence + window_count),
+        slice_params,
     ).fetchall()
     conn.close()
 
-    return "\n---\n".join(row[2] for row in rows)
+    return "\n---\n".join(
+        f"[source: {row[3]} @ {row[0]}]\n{row[2]}" for row in rows
+    )
 
 
-def list_events(db_path: str, limit: int) -> list[dict[str, Any]]:
+def list_events(
+    db_path: str, limit: int, test_id: str | None = None,
+) -> list[dict[str, Any]]:
     conn = connect(db_path)
     cur = conn.cursor()
+    clauses = []
+    params: list[Any] = []
+    if test_id:
+        clauses.append("test_id = ?")
+        params.append(test_id)
+    where = ""
+    if clauses:
+        where = " WHERE " + " AND ".join(f"({c})" for c in clauses)
+    params.append(limit)
     rows = cur.execute(
-        """
-        SELECT timestamp, sequence, msg_code, msg_type, summary
+        f"""
+        SELECT timestamp, sequence, msg_code, msg_type, summary,
+               test_id, source_file, chunk_seq
         FROM events
+        {where}
         ORDER BY sequence ASC
         LIMIT ?
         """,
-        (limit,),
+        params,
     ).fetchall()
     conn.close()
     return [
@@ -180,23 +235,35 @@ def list_events(db_path: str, limit: int) -> list[dict[str, Any]]:
             "msg_code": row[2],
             "event": row[3],
             "summary": row[4],
+            "test_id": row[5],
+            "source_file": row[6],
+            "chunk_seq": row[7],
         }
         for row in rows
     ]
 
 
-def query_nas(db_path: str, all_events: bool = False) -> list[dict[str, Any]]:
-    """Queries 5GMM/EMM rejects, timers, and cause codes."""
+def query_nas(
+    db_path: str, all_events: bool = False, test_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """Queries 5GMM/EMM rejects, timers, and cause codes.
+
+    Scope to a single test run via ``test_id`` when set.
+    """
     conn = connect(db_path)
     cur = conn.cursor()
-    query = """
-        SELECT timestamp, rat, msg_id, cause_code, cause_str, t3346_timer, t3502_timer
-        FROM nas_events
-    """
+    clauses: list[str] = []
+    params: list[Any] = []
     if not all_events:
-        query += " WHERE cause_code IS NOT NULL"
+        clauses.append("cause_code IS NOT NULL")
+    if test_id:
+        clauses.append("test_id = ?")
+        params.append(test_id)
+    query = "SELECT timestamp, rat, msg_id, cause_code, cause_str, t3346_timer, t3502_timer, source_file FROM nas_events"
+    if clauses:
+        query += " WHERE " + " AND ".join(f"({c})" for c in clauses)
     query += " ORDER BY timestamp ASC, sequence ASC"
-    rows = cur.execute(query).fetchall()
+    rows = cur.execute(query, params).fetchall()
     conn.close()
     return [
         {
@@ -207,9 +274,105 @@ def query_nas(db_path: str, all_events: bool = False) -> list[dict[str, Any]]:
             "cause_str": r[4],
             "t3346_timer": r[5],
             "t3502_timer": r[6],
+            "source_file": r[7],
         }
         for r in rows
     ]
+
+
+def list_tests(db_path: str) -> list[dict[str, Any]]:
+    """Return per-test summary rows: test_id, chunk count, time span, record counts."""
+    conn = connect(db_path)
+    cur = conn.cursor()
+    out: list[dict[str, Any]] = []
+    try:
+        # Aggregate events/nas/rf counts per test_id in one pass each. UNION ALL
+        # keeps the agent's query plan simple even when one of the tables has
+        # no rows for a given test_id.
+        cur.execute(
+            """
+            CREATE TEMP VIEW IF NOT EXISTS _test_events AS
+            SELECT test_id, COUNT(*) AS n FROM events GROUP BY test_id
+            """
+        )
+        cur.execute(
+            """
+            CREATE TEMP VIEW IF NOT EXISTS _test_nas AS
+            SELECT test_id, COUNT(*) AS n FROM nas_events GROUP BY test_id
+            """
+        )
+        cur.execute(
+            """
+            CREATE TEMP VIEW IF NOT EXISTS _test_rf AS
+            SELECT test_id, COUNT(*) AS n FROM rf_kpis GROUP BY test_id
+            """
+        )
+
+        rows = cur.execute(
+            """
+            SELECT
+                e.test_id,
+                COUNT(DISTINCT e.source_file) AS chunks,
+                MIN(e.chunk_seq) AS first_chunk,
+                MAX(e.chunk_seq) AS last_chunk,
+                MIN(e.timestamp) AS first_timestamp,
+                MAX(e.timestamp) AS last_timestamp,
+                COALESCE(e_n.n, 0) AS event_count,
+                COALESCE(n.n, 0)   AS nas_count,
+                COALESCE(r.n, 0)   AS rf_count
+            FROM events e
+            LEFT JOIN _test_events e_n ON e_n.test_id = e.test_id
+            LEFT JOIN _test_nas n ON n.test_id = e.test_id
+            LEFT JOIN _test_rf r ON r.test_id = e.test_id
+            GROUP BY e.test_id
+            ORDER BY MIN(e.timestamp) ASC
+            """
+        ).fetchall()
+        # Also pick up test_ids that exist only in nas_events / rf_kpis
+        # (rare but possible if events table was dropped on a re-index).
+        extras = cur.execute(
+            """
+            SELECT test_id, 'nas' AS kind FROM nas_events
+            UNION SELECT test_id, 'rf' AS kind FROM rf_kpis
+            """
+        ).fetchall()
+        seen = {row[0] for row in rows}
+        for tid, kind in extras:
+            if not tid or tid in seen:
+                continue
+            out.append({
+                "test_id": tid,
+                "chunks": 0,
+                "first_chunk": None,
+                "last_chunk": None,
+                "first_timestamp": None,
+                "last_timestamp": None,
+                "event_count": 0,
+                "nas_count": 1 if kind == "nas" else 0,
+                "rf_count": 1 if kind == "rf" else 0,
+                "note": "test_id present in {kind} only",
+            })
+    except sqlite3.OperationalError:
+        # Pre-multifile DBs have no test_id column; surface empty result
+        # instead of crashing so the agent can still list legacy data.
+        conn.close()
+        return []
+    conn.close()
+
+    for tid, chunks, first_chunk, last_chunk, first_ts, last_ts, ev_n, nas_n, rf_n in rows:
+        out.append({
+            "test_id": tid or "(unset)",
+            "chunks": chunks,
+            "first_chunk_seq": first_chunk,
+            "last_chunk_seq": last_chunk,
+            "first_timestamp": first_ts,
+            "last_timestamp": last_ts,
+            "event_count": ev_n,
+            "nas_event_count": nas_n,
+            "rf_kpi_count": rf_n,
+        })
+    out.sort(key=lambda r: (r.get("first_timestamp") or "", r["test_id"]))
+    return out
 
 
 def parser_health(db_path: str) -> dict[str, Any]:
@@ -392,6 +555,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
+
+    list_parser = subparsers.add_parser(
+        "list-tests",
+        help="List every test_id indexed in the DB with chunk + record counts",
+    )
+
     anomalies_parser = subparsers.add_parser("anomalies", help="List likely teardown/failure events")
     anomalies_parser.add_argument(
         "--with-cause", action="store_true",
@@ -401,7 +570,16 @@ def parse_args() -> argparse.Namespace:
         "--cause", type=str, default=None,
         help="Filter anomalies to those whose releaseCause matches this value",
     )
-    subparsers.add_parser("rf-summary", help="Summarize RF KPIs")
+    anomalies_parser.add_argument(
+        "--test-id", dest="test_id", default=None,
+        help="Scope results to a single logical test run.",
+    )
+
+    rf_summary_parser = subparsers.add_parser("rf-summary", help="Summarize RF KPIs")
+    rf_summary_parser.add_argument(
+        "--test-id", dest="test_id", default=None,
+        help="Scope RF summary to a single logical test run.",
+    )
 
     nas_parser = subparsers.add_parser(
         "nas", help="Query 5GMM/EMM rejects, timers, and cause codes"
@@ -410,6 +588,10 @@ def parse_args() -> argparse.Namespace:
         "--all",
         action="store_true",
         help="List all NAS events (not only those with cause codes)",
+    )
+    nas_parser.add_argument(
+        "--test-id", dest="test_id", default=None,
+        help="Scope NAS query to a single logical test run.",
     )
 
     window_parser = subparsers.add_parser(
@@ -423,6 +605,10 @@ def parse_args() -> argparse.Namespace:
         default=5,
         help="Number of indexed events before and after the target, default: 5",
     )
+    window_parser.add_argument(
+        "--test-id", dest="test_id", default=None,
+        help="Scope window to a single logical test run.",
+    )
 
     events_parser = subparsers.add_parser("events", help="List indexed events")
     events_parser.add_argument(
@@ -431,6 +617,10 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=50,
         help="Maximum events to print, default: 50",
+    )
+    events_parser.add_argument(
+        "--test-id", dest="test_id", default=None,
+        help="Scope event listing to a single logical test run.",
     )
 
     health_parser = subparsers.add_parser(
@@ -477,20 +667,38 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     try:
-        if args.command == "anomalies":
-            anomalies = query_anomalies(args.db, include_cause=getattr(args, "with_cause", False))
+        if args.command == "list-tests":
+            print(json.dumps(list_tests(args.db), indent=2))
+        elif args.command == "anomalies":
+            anomalies = query_anomalies(
+                args.db,
+                include_cause=getattr(args, "with_cause", False),
+                test_id=getattr(args, "test_id", None),
+            )
             # Optional cause filtering
             if getattr(args, "cause", None):
                 anomalies = [a for a in anomalies if a.get("releaseCause") == args.cause]
             print(json.dumps(anomalies, indent=2))
         elif args.command == "rf-summary":
-            print(json.dumps(get_rf_summary(args.db), indent=2))
+            print(json.dumps(
+                get_rf_summary(args.db, test_id=getattr(args, "test_id", None)),
+                indent=2,
+            ))
         elif args.command == "nas":
-            print(json.dumps(query_nas(args.db, all_events=args.all), indent=2))
+            print(json.dumps(
+                query_nas(args.db, all_events=args.all, test_id=getattr(args, "test_id", None)),
+                indent=2,
+            ))
         elif args.command == "window":
-            print(get_context_window(args.db, args.timestamp, args.count))
+            print(get_context_window(
+                args.db, args.timestamp, args.count,
+                test_id=getattr(args, "test_id", None),
+            ))
         elif args.command == "events":
-            print(json.dumps(list_events(args.db, args.limit), indent=2))
+            print(json.dumps(
+                list_events(args.db, args.limit, test_id=getattr(args, "test_id", None)),
+                indent=2,
+            ))
         elif args.command == "parser-health":
             print(json.dumps(parser_health(args.db), indent=2))
         elif args.command == "parser-failures":

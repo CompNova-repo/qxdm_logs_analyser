@@ -10,12 +10,18 @@ numeric validation, and the SQLite writes — remain in code.
 Run::
 
     python3 indexer.py <log_file> [db_path] [--append] [--config candidate.json]
+    python3 indexer.py --test-id <ID> file1.txt file2.txt ...
+    python3 indexer.py --dir <input_dir> [--test-id <ID>]
 
 The ``--dry-run`` flag runs the indexer against the whole log without writing
 the events/NAS/RF tables, but always populates ``parser_health`` and
 ``parser_failures`` so the agent can diff candidate vs. production extraction
 quality. ``--promote`` atomically replaces ``parser_config.json`` with the
 candidate after a dry-run whose failure counts dropped.
+
+Multi-file runs: each record carries ``test_id``, ``source_file``, and
+``chunk_seq`` provenance. ``sequence`` is global across files so context
+windows continue across chunk boundaries.
 """
 
 from __future__ import annotations
@@ -160,6 +166,16 @@ class ParserStats:
 
 @dataclass
 class IndexerState:
+    """Per-file parse state.
+
+    Carries provenance metadata (``test_id``, ``source_file``, ``chunk_seq``)
+    for every emitted record so the SQLite index supports cross-file queries
+    on a single test run while preserving single-file ergonomics.
+    """
+
+    test_id: str = ""
+    source_file: str = ""
+    chunk_seq: int = 0
     events: list[tuple] = field(default_factory=list)
     nas: list[tuple] = field(default_factory=list)
     rf: list[tuple] = field(default_factory=list)
@@ -235,7 +251,8 @@ def _parse_nas(state: IndexerState, parser_cfg: dict[str, Any], ts: str, seq: in
     timer_values = {name: decode_gprs_timer2(block_text, name) for name in timers}
 
     state.nas.append(
-        (ts, seq, rat, msg_type, cause_code, cause_str,
+        (state.test_id, state.source_file, state.chunk_seq,
+         ts, seq, rat, msg_type, cause_code, cause_str,
          timer_values.get("t3346"), timer_values.get("t3502"), block_text)
     )
 
@@ -243,7 +260,10 @@ def _parse_nas(state: IndexerState, parser_cfg: dict[str, Any], ts: str, seq: in
         "summary_format", "NAS [{rat}] Cause={cause_str}"
     )
     summary = summary_format.format(rat=rat, cause_str=cause_str)
-    state.events.append((ts, seq, code, code, msg_type, summary, block_text))
+    state.events.append(
+        (state.test_id, state.source_file, state.chunk_seq,
+         ts, seq, code, code, msg_type, summary, block_text)
+    )
     return True
 
 
@@ -281,7 +301,8 @@ def _parse_nr_searcher(state: IndexerState, parser_cfg: dict[str, Any], ts: str,
                 state.stats["nr_searcher"].invalid_value += 1
                 continue
         state.rf.append(
-            (ts, seq, "5GNR", arfcn_val, pci_val, rsrp_val, rsrq_val, None, None)
+            (state.test_id, state.source_file, state.chunk_seq,
+             ts, seq, "5GNR", arfcn_val, pci_val, rsrp_val, rsrq_val, None, None)
         )
         emitted = True
 
@@ -299,7 +320,8 @@ def _parse_nr_searcher(state: IndexerState, parser_cfg: dict[str, Any], ts: str,
             pci_val = _safe_int(pci_match.group(1)) if pci_match else None
             if rsrp_val is not None and _range(rsrp_val, rsrp_min, rsrp_max):
                 state.rf.append(
-                    (ts, seq, "5GNR",
+                    (state.test_id, state.source_file, state.chunk_seq,
+                     ts, seq, "5GNR",
                      arfcn_val if arfcn_val is not None else arfcn_fallback,
                      pci_val, rsrp_val, rsrq_val, None, None)
                 )
@@ -339,7 +361,8 @@ def _parse_lte_rf(state: IndexerState, parser_cfg: dict[str, Any], ts: str,
         return False
 
     state.rf.append(
-        (ts, seq, "LTE", None, None, rsrp_val, rsrq_val, rssi_val, snr_val)
+        (state.test_id, state.source_file, state.chunk_seq,
+         ts, seq, "LTE", None, None, rsrp_val, rsrq_val, rssi_val, snr_val)
     )
     return True
 
@@ -353,19 +376,53 @@ def _parse_rrc_event(state: IndexerState, parser_cfg: dict[str, Any], ts: str,
         summary = m.group(1).strip() if m else msg_type
     else:
         summary = msg_type
-    state.events.append((ts, seq, code, code, msg_type, summary, block_text))
+    state.events.append(
+        (state.test_id, state.source_file, state.chunk_seq,
+         ts, seq, code, code, msg_type, summary, block_text)
+    )
     return True
 
 
 def _parse_rrc_state(state: IndexerState, ts: str, seq: int, code: str,
                      msg_type: str, block_text: str) -> bool:
-    state.events.append((ts, seq, code, code, msg_type, msg_type, block_text))
+    state.events.append(
+        (state.test_id, state.source_file, state.chunk_seq,
+         ts, seq, code, code, msg_type, msg_type, block_text)
+    )
     return True
 
 
 # ---------------------------------------------------------------------------
 # Database setup (events + parser-health schema)
 # ---------------------------------------------------------------------------
+
+
+def _column_names(cur: sqlite3.Cursor, table: str) -> set[str]:
+    """Return the set of column names on ``table`` (empty if it doesn't exist).
+
+    Used by idempotent migrations to decide whether ``ALTER TABLE ... ADD
+    COLUMN`` is needed.
+    """
+    try:
+        rows = cur.execute(f"PRAGMA table_info({table})").fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {row[1] for row in rows}
+
+
+def _add_column_if_missing(
+    cur: sqlite3.Cursor, table: str, column: str, decl: str,
+) -> None:
+    """Run ``ALTER TABLE ... ADD COLUMN`` only when the column is absent.
+
+    SQLite has no ``ADD COLUMN IF NOT EXISTS``, so we use PRAGMA table_info
+    to gate the migration. This keeps ``init_db`` idempotent across schema
+    revisions — fresh DBs get the column through the initial ``CREATE``,
+    older DBs get it through the ``ALTER`` branch.
+    """
+    if column in _column_names(cur, table):
+        return
+    cur.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
 
 
 def init_db(db_path: str = "qxdm_indexed.db", append: bool = False) -> sqlite3.Connection:
@@ -379,6 +436,9 @@ def init_db(db_path: str = "qxdm_indexed.db", append: bool = False) -> sqlite3.C
     cur.execute("""
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            test_id TEXT NOT NULL DEFAULT '',
+            source_file TEXT NOT NULL DEFAULT '',
+            chunk_seq INTEGER NOT NULL DEFAULT 0,
             timestamp TEXT, sequence INTEGER, msg_code TEXT, subsys TEXT,
             msg_type TEXT, summary TEXT, raw_block TEXT
         )
@@ -386,6 +446,9 @@ def init_db(db_path: str = "qxdm_indexed.db", append: bool = False) -> sqlite3.C
     cur.execute("""
         CREATE TABLE IF NOT EXISTS nas_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            test_id TEXT NOT NULL DEFAULT '',
+            source_file TEXT NOT NULL DEFAULT '',
+            chunk_seq INTEGER NOT NULL DEFAULT 0,
             timestamp TEXT, sequence INTEGER, rat TEXT, msg_id TEXT,
             cause_code INTEGER, cause_str TEXT,
             t3346_timer INTEGER, t3502_timer INTEGER, raw_block TEXT
@@ -394,15 +457,33 @@ def init_db(db_path: str = "qxdm_indexed.db", append: bool = False) -> sqlite3.C
     cur.execute("""
         CREATE TABLE IF NOT EXISTS rf_kpis (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            test_id TEXT NOT NULL DEFAULT '',
+            source_file TEXT NOT NULL DEFAULT '',
+            chunk_seq INTEGER NOT NULL DEFAULT 0,
             timestamp TEXT, sequence INTEGER, rat TEXT, arfcn INTEGER,
             pci INTEGER, rsrp REAL, rsrq REAL, rssi REAL, snr REAL
         )
     """)
+
+    # Idempotent column adds for DBs created before the multi-file schema.
+    for table in ("events", "nas_events", "rf_kpis"):
+        _add_column_if_missing(cur, table, "test_id", "TEXT NOT NULL DEFAULT ''")
+        _add_column_if_missing(cur, table, "source_file", "TEXT NOT NULL DEFAULT ''")
+        _add_column_if_missing(cur, table, "chunk_seq", "INTEGER NOT NULL DEFAULT 0")
+
     cur.execute("CREATE INDEX IF NOT EXISTS idx_events_ts ON events(timestamp)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_events_seq ON events(sequence)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_events_type ON events(msg_type)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_test ON events(test_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_test_ts ON events(test_id, timestamp)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_test_msgtype ON events(test_id, msg_type)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_events_chunk ON events(test_id, chunk_seq)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_nas_ts ON nas_events(timestamp)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_nas_test ON nas_events(test_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_nas_test_ts ON nas_events(test_id, timestamp)")
     cur.execute("CREATE INDEX IF NOT EXISTS idx_rf_ts ON rf_kpis(timestamp)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_rf_test ON rf_kpis(test_id)")
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_rf_test_ts ON rf_kpis(test_id, timestamp)")
 
     # Parser health is rewritten on every run so the agent always sees
     # statistics for the most recent indexing pass.
@@ -463,8 +544,20 @@ def parse_log(
     config_path: str = DEFAULT_CONFIG_PATH,
     dry_run: bool = False,
     quiet_overlaps: bool = False,
+    test_id: str = "",
+    source_file: str = "",
+    chunk_seq: int = 0,
 ) -> dict[str, Any]:
-    """Index ``file_path`` into ``db_path`` and return parser-health summary."""
+    """Index ``file_path`` into ``db_path`` and return parser-health summary.
+
+    Multi-file provenance:
+
+    * ``test_id`` groups records belonging to the same logical test run.
+    * ``source_file`` records the originating filename for cross-chunk queries.
+    * ``chunk_seq`` orders chunks within a test run. The global ``sequence``
+      column continues to grow across chunks via the existing
+      ``MAX(sequence)+1`` strategy when ``append=True``.
+    """
     config = load_config(config_path)
     # Validate log file exists early with a clear message (promote_config already does).
     if not Path(file_path).is_file():
@@ -485,7 +578,11 @@ def parse_log(
         current_seq = None
         current_block: list[str] = []
 
-        state = IndexerState()
+        state = IndexerState(
+            test_id=test_id,
+            source_file=source_file or Path(file_path).name,
+            chunk_seq=chunk_seq,
+        )
         sampling = config.get("failure_sampling", {}) or {}
         max_samples = int(sampling.get("max_samples_per_parser", 20))
         max_unknown = int(sampling.get("max_samples_per_unknown_code", 10))
@@ -615,18 +712,22 @@ def parse_log(
 
         if not dry_run:
             cur.executemany(
-                "INSERT INTO events (timestamp, sequence, msg_code, subsys, msg_type, summary, raw_block) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO events (test_id, source_file, chunk_seq, "
+                "timestamp, sequence, msg_code, subsys, msg_type, summary, raw_block) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 state.events,
             )
             cur.executemany(
-                "INSERT INTO nas_events (timestamp, sequence, rat, msg_id, cause_code, cause_str, t3346_timer, t3502_timer, raw_block) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO nas_events (test_id, source_file, chunk_seq, "
+                "timestamp, sequence, rat, msg_id, cause_code, cause_str, "
+                "t3346_timer, t3502_timer, raw_block) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 state.nas,
             )
             cur.executemany(
-                "INSERT INTO rf_kpis (timestamp, sequence, rat, arfcn, pci, rsrp, rsrq, rssi, snr) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "INSERT INTO rf_kpis (test_id, source_file, chunk_seq, "
+                "timestamp, sequence, rat, arfcn, pci, rsrp, rsrq, rssi, snr) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 state.rf,
             )
 
@@ -763,18 +864,181 @@ def promote_candidate(candidate_path: str, target_path: str = DEFAULT_CONFIG_PAT
     print(f"[✓] Promoted {src} → {dst}", file=sys.stderr)
 
 
+# ---------------------------------------------------------------------------
+# Multi-file orchestration
+# ---------------------------------------------------------------------------
+
+
+def parse_files(
+    files: list[str],
+    db_path: str = "qxdm_indexed.db",
+    config_path: str = DEFAULT_CONFIG_PATH,
+    test_id: str = "",
+    dry_run: bool = False,
+    quiet_overlaps: bool = False,
+    chunk_sequences: list[int] | None = None,
+) -> dict[str, Any]:
+    """Index a sequence of log files into ``db_path`` as one logical run.
+
+    Parameters
+    ----------
+    files:
+        Ordered list of input ``.txt`` paths. Order is preserved; the batch
+        processor pre-sorts by ``chunk_seq`` and the caller can override it.
+    db_path:
+        Target SQLite database.
+    config_path:
+        Parser config (JSON).
+    test_id:
+        Test-run identifier; recorded on every row.
+    dry_run, quiet_overlaps:
+        Forwarded to :func:`parse_log`.
+    chunk_sequences:
+        Per-file ``chunk_seq``. When ``None`` (default), ``chunk_seq`` is
+        ``1..len(files)`` so the first chunk is ``1``.
+
+    Returns
+    -------
+    dict
+        Aggregated health summary across all files plus per-file
+        ``{"file", "events", "nas", "rf", "blocks", "chunk_seq"}`` records.
+    """
+    if not files:
+        raise ValueError("parse_files requires at least one input file")
+
+    if chunk_sequences is None:
+        chunk_sequences = list(range(1, len(files) + 1))
+    if len(chunk_sequences) != len(files):
+        raise ValueError(
+            f"chunk_sequences length ({len(chunk_sequences)}) must match "
+            f"number of files ({len(files)})"
+        )
+
+    per_file: list[dict[str, Any]] = []
+    merged_health: dict[str, ParserStats] = defaultdict(ParserStats)
+    totals = {"events": 0, "nas": 0, "rf": 0, "blocks": 0}
+
+    # Every file is appended to ``db_path`` (the orchestrator owns
+    # rebuilds). ``append=True`` on a missing DB is identical to
+    # ``append=False``; if the caller wants a fresh DB they should delete
+    # it explicitly before calling this function.
+    for idx, raw_path in enumerate(files):
+        path = Path(raw_path)
+        health = parse_log(
+            str(path),
+            db_path=db_path,
+            append=True,
+            config_path=config_path,
+            dry_run=dry_run,
+            quiet_overlaps=quiet_overlaps,
+            test_id=test_id,
+            source_file=path.name,
+            chunk_seq=int(chunk_sequences[idx]),
+        )
+        per_file.append({
+            "file": path.name,
+            "chunk_seq": int(chunk_sequences[idx]),
+            "events": health.get("total_blocks", 0) and sum(
+                v.get("parsed", 0) for v in health.get("parsers", {}).values()
+            ),
+            "blocks": health.get("total_blocks", 0),
+            "health": health,
+        })
+        totals["blocks"] += health.get("total_blocks", 0)
+        for pname, stats in health.get("parsers", {}).items():
+            merged = merged_health[pname]
+            merged.matched += int(stats.get("matched", 0))
+            merged.parsed += int(stats.get("parsed", 0))
+            merged.failed += int(stats.get("failed", 0))
+            merged.invalid_value += int(stats.get("invalid_value", 0))
+
+    # Read final counts directly from the DB so the totals match what's
+    # actually indexed (parse_log may have skipped rows that didn't yield a
+    # parser match).
+    counts = {"events": 0, "nas": 0, "rf": 0}
+    if not dry_run and Path(db_path).exists():
+        try:
+            with sqlite3.connect(db_path) as conn:
+                cur = conn.cursor()
+                if test_id:
+                    counts["events"] = cur.execute(
+                        "SELECT COUNT(*) FROM events WHERE test_id = ?", (test_id,)
+                    ).fetchone()[0]
+                    counts["nas"] = cur.execute(
+                        "SELECT COUNT(*) FROM nas_events WHERE test_id = ?", (test_id,)
+                    ).fetchone()[0]
+                    counts["rf"] = cur.execute(
+                        "SELECT COUNT(*) FROM rf_kpis WHERE test_id = ?", (test_id,)
+                    ).fetchone()[0]
+                else:
+                    counts["events"] = cur.execute(
+                        "SELECT COUNT(*) FROM events"
+                    ).fetchone()[0]
+                    counts["nas"] = cur.execute(
+                        "SELECT COUNT(*) FROM nas_events"
+                    ).fetchone()[0]
+                    counts["rf"] = cur.execute(
+                        "SELECT COUNT(*) FROM rf_kpis"
+                    ).fetchone()[0]
+        except sqlite3.OperationalError:
+            pass
+
+    return {
+        "test_id": test_id,
+        "db_path": db_path,
+        "file_count": len(files),
+        "totals": {
+            "blocks": totals["blocks"],
+            "events": counts["events"],
+            "nas_events": counts["nas"],
+            "rf_kpis": counts["rf"],
+        },
+        "parsers": {
+            name: {
+                "matched": st.matched,
+                "parsed": st.parsed,
+                "failed": st.failed,
+                "invalid_value": st.invalid_value,
+            }
+            for name, st in merged_health.items()
+        },
+        "files": per_file,
+    }
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Parse QXDM log file into SQLite index.",
+        description="Parse QXDM log file(s) into SQLite index.",
     )
-    parser.add_argument("log_file", help="Path to QXDM decoded log text file")
     parser.add_argument(
-        "db_path", nargs="?", default="qxdm_indexed.db",
-        help="Target SQLite database path",
+        "log_files", nargs="*",
+        help="Path(s) to QXDM decoded log text files. Pass multiple to "
+             "merge chunks into one logical test run.",
+    )
+    parser.add_argument(
+        "--db", dest="db_path", default="qxdm_indexed.db",
+        help="Target SQLite database path (default: qxdm_indexed.db).",
+    )
+    # Legacy alias: ``python3 indexer.py log.txt [db_path]`` still works.
+    parser.add_argument(
+        "legacy_db_path", nargs="?",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--dir", dest="input_dir", default=None,
+        help="Index every ``*.txt`` in the given directory in lexical "
+             "order. Combine with --test-id for multi-file runs.",
+    )
+    parser.add_argument(
+        "--test-id", dest="test_id", default=None,
+        help="Logical test-run identifier recorded on every row. Required "
+             "when indexing more than one file at a time so the agent can "
+             "query across chunk boundaries.",
     )
     parser.add_argument(
         "--append", action="store_true",
-        help="Append to existing database instead of overwriting",
+        help="Append to existing database instead of overwriting. Auto-enabled "
+             "for every file after the first in a multi-file run.",
     )
     parser.add_argument(
         "--config", default=DEFAULT_CONFIG_PATH,
@@ -799,18 +1063,79 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
 
-    if not Path(args.log_file).is_file():
-        parser.error(f"log file not found: {args.log_file}")
+    # Legacy positional db path override
+    if args.legacy_db_path and args.db_path == "qxdm_indexed.db":
+        args.db_path = args.legacy_db_path
 
-    # Guard against the dry-run footgun: a user who runs ``indexer.py <log>
-    # --dry-run`` is probably not aware that ``qxdm_indexed.db`` is the
-    # production DB. Redirect to a scratch DB so --dry-run never clobbers
-    # production. ``init_db()`` will unlink and rebuild the scratch DB on
-    # each --dry-run invocation, so repeated dry-runs against the same log
-    # are safe and don't require --append. Default rebuilds
-    # (``indexer.py <log> qxdm_indexed.db`` without --append) are the
-    # documented rebuild workflow and proceed via the same unlink+rebuild
-    # path.
+    # Resolve input files: explicit positional args > --dir > stdin.
+    if args.log_files and args.input_dir:
+        parser.error("pass either positional log files OR --dir, not both")
+    if args.input_dir:
+        in_dir = Path(args.input_dir)
+        if not in_dir.is_dir():
+            parser.error(f"--dir not a directory: {in_dir}")
+        args.log_files = sorted(str(p) for p in in_dir.glob("*.txt") if p.is_file())
+        if not args.log_files:
+            parser.error(f"no .txt files found in {in_dir}")
+
+    if not args.log_files:
+        parser.error(
+            "no input logs provided — pass positional log files or --dir <dir>"
+        )
+
+    # Single-file path: keep backwards-compatible behaviour and warn if
+    # --test-id missing (records will still default to '' but downstream
+    # queries can't filter without it).
+    if len(args.log_files) == 1 and not args.input_dir:
+        log_file = args.log_files[0]
+        if not Path(log_file).is_file():
+            parser.error(f"log file not found: {log_file}")
+        # Guard against the dry-run footgun: redirect to a scratch DB so
+        # --dry-run never clobbers production. ``init_db()`` will unlink and
+        # rebuild the scratch DB on each --dry-run invocation, so repeated
+        # dry-runs against the same log are safe and don't require --append.
+        db_path = args.db_path
+        if args.dry_run and db_path == "qxdm_indexed.db":
+            db_path = "qxdm_dryrun.db"
+            print(
+                f"[*] --dry-run: writing to scratch DB {db_path} "
+                "(pass an explicit db_path to override)",
+                file=sys.stderr,
+            )
+
+        try:
+            health = parse_log(
+                log_file, db_path=db_path, append=args.append,
+                config_path=args.config, dry_run=args.dry_run,
+                quiet_overlaps=args.quiet_overlaps,
+                test_id=args.test_id or "",
+                source_file=Path(log_file).name,
+                chunk_seq=1 if args.test_id else 0,
+            )
+        except ConfigValidationError as exc:
+            print(f"error: invalid parser config ({args.config}): {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+        except FileNotFoundError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            raise SystemExit(2) from exc
+
+        if args.promote:
+            promote_candidate(args.config)
+        print(json.dumps(health, indent=2))
+        raise SystemExit(0)
+
+    # Multi-file path: require --test-id so downstream agents can filter.
+    if not args.test_id:
+        parser.error(
+            "multi-file ingestion requires --test-id so chunks can be "
+            "queried as one logical run"
+        )
+
+    # Validate every file before we start (fail fast).
+    for log_file in args.log_files:
+        if not Path(log_file).is_file():
+            parser.error(f"log file not found: {log_file}")
+
     db_path = args.db_path
     if args.dry_run and db_path == "qxdm_indexed.db":
         db_path = "qxdm_dryrun.db"
@@ -821,9 +1146,12 @@ if __name__ == "__main__":
         )
 
     try:
-        health = parse_log(
-            args.log_file, db_path=db_path, append=args.append,
-            config_path=args.config, dry_run=args.dry_run,
+        result = parse_files(
+            files=list(args.log_files),
+            db_path=db_path,
+            config_path=args.config,
+            test_id=args.test_id,
+            dry_run=args.dry_run,
             quiet_overlaps=args.quiet_overlaps,
         )
     except ConfigValidationError as exc:
@@ -835,5 +1163,4 @@ if __name__ == "__main__":
 
     if args.promote:
         promote_candidate(args.config)
-
-    print(json.dumps(health, indent=2))
+    print(json.dumps(result, indent=2, default=str))
