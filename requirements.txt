@@ -1,0 +1,18 @@
+# QXDM Logs Analyser — third-party Python dependencies.
+#
+# The core CLI tools (indexer.py, batch_processor.py, qxdm_tool.py,
+# parser_config_schema.py) intentionally use only the Python standard
+# library, so they have no requirements. The dependencies below are
+# only needed for the qxdm_init service (FastAPI/uvicorn/pydantic) and
+# the test suite (pytest).
+#
+# Pinned to the Pydantic v2 line because qxdm_init/api_server.py uses
+# @field_validator (a v2-only API).
+
+# --- qxdm_init service ---
+fastapi>=0.110,<1.0
+pydantic>=2.0,<3.0
+uvicorn>=0.27,<1.0
+
+# --- test suite ---
+pytest>=7.0,<9.0

@@ -1,7 +1,8 @@
 *.txt
 .env
+!requirements.txt
 CLAUDE.md
-venv/
+.venv/
 .claude/worktrees/
 __pycache__/
 *.pyc
