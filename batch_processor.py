@@ -33,10 +33,12 @@ import datetime as _dt
 import hashlib
 import json
 import logging
+import os
 import re
 import shutil
 import sqlite3
 import sys
+import tempfile
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -204,6 +206,88 @@ def _sha256(path: Path, chunk_size: int = 65536) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Database staging / provenance helpers
+# ---------------------------------------------------------------------------
+
+_PROVENANCE_TABLES = ("events", "nas_events", "rf_kpis")
+
+
+def _existing_provenance(
+    db_path: str | Path, test_id: str,
+) -> tuple[set[str], set[int]]:
+    """Return source filenames and chunk numbers already stored for a run.
+
+    Older databases may not have the multi-file tables/columns yet.  Those
+    are treated as having no provenance and are upgraded by the indexer when
+    the next group is committed.
+    """
+    path = Path(db_path)
+    if not path.is_file():
+        return set(), set()
+
+    sources: set[str] = set()
+    sequences: set[int] = set()
+    try:
+        with sqlite3.connect(str(path)) as conn:
+            for table in _PROVENANCE_TABLES:
+                try:
+                    rows = conn.execute(
+                        f"SELECT DISTINCT source_file, chunk_seq FROM {table} "
+                        "WHERE test_id = ?",  # noqa: S608 - fixed table names
+                        (test_id,),
+                    ).fetchall()
+                except sqlite3.OperationalError:
+                    continue
+                for source_file, chunk_seq in rows:
+                    if source_file:
+                        sources.add(str(source_file))
+                    if chunk_seq is not None:
+                        sequences.add(int(chunk_seq))
+    except sqlite3.Error as exc:
+        log.warning("could not inspect existing provenance in %s: %s", path, exc)
+    return sources, sequences
+
+
+def _missing_chunk_sequences(sequences: Iterable[int]) -> list[int]:
+    """Find internal gaps in known positive chunk sequence numbers.
+
+    A missing leading or trailing chunk cannot be inferred without a capture
+    manifest.  Internal gaps are unambiguous, including gaps formed by the
+    union of already-indexed chunks and newly arrived chunks.
+    """
+    known = sorted({int(seq) for seq in sequences if int(seq) > 0})
+    if len(known) < 2:
+        return []
+    return sorted(set(range(known[0], known[-1] + 1)).difference(known))
+
+
+def _staging_database(db_path: str | Path) -> Path:
+    """Create a private SQLite copy next to ``db_path`` for group ingestion.
+
+    Parsing all chunks into this copy keeps partially indexed groups invisible.
+    Once validation succeeds, :func:`os.replace` publishes the complete DB in
+    one atomic filesystem operation.
+    """
+    target = Path(db_path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".staging", dir=str(target.parent),
+    )
+    os.close(fd)
+    staged = Path(tmp_name)
+    if not target.is_file():
+        return staged
+
+    try:
+        with sqlite3.connect(str(target)) as source, sqlite3.connect(str(staged)) as dest:
+            source.backup(dest)
+    except Exception:
+        staged.unlink(missing_ok=True)
+        raise
+    return staged
+
+
+# ---------------------------------------------------------------------------
 # File movement helpers (cross-volume safe, Windows-safe)
 # ---------------------------------------------------------------------------
 
@@ -321,8 +405,10 @@ def process_directory(
     for test_id, refs in grouped.items():
         _emit(f"processing test_id={test_id}: {len(refs)} file(s)")
 
-        # Stability check + hashing
+        # A run is the unit of work.  If even one chunk is missing or still
+        # changing, hold every file in place for the next scan.
         ready: list[ChunkRef] = []
+        readiness_errors: list[str] = []
         for ref in refs:
             if not ref.path.is_file():
                 summary.failed_at_setup.append({
@@ -330,6 +416,7 @@ def process_directory(
                     "filename": ref.path.name,
                     "reason": "missing",
                 })
+                readiness_errors.append(f"{ref.path.name}: missing")
                 continue
             if not _wait_for_size_stability(ref.path, stability_window, max_wait):
                 summary.failed_at_setup.append({
@@ -337,20 +424,23 @@ def process_directory(
                     "filename": ref.path.name,
                     "reason": "size_unstable",
                 })
+                readiness_errors.append(f"{ref.path.name}: size_unstable")
                 continue
             ready.append(ref)
 
-        if not ready:
+        if readiness_errors:
             summary.groups.append(GroupResult(
                 test_id=test_id, files=[],
                 manifest_path=None, status="skipped",
-                error="no files passed the stability check",
+                error="group held until all chunks are stable: "
+                      + "; ".join(readiness_errors),
             ))
             continue
 
         # Hash + size before ingestion so the manifest is complete
         # regardless of move outcome.
         metadata: list[dict[str, Any]] = []
+        metadata_errors: list[str] = []
         for ref in ready:
             try:
                 sha = _sha256(ref.path)
@@ -361,8 +451,8 @@ def process_directory(
                     "filename": ref.path.name,
                     "reason": f"hash_or_stat_failed: {exc}",
                 })
-                sha = ""
-                size = 0
+                metadata_errors.append(f"{ref.path.name}: {exc}")
+                continue
             metadata.append({
                 "filename": ref.path.name,
                 "size_bytes": size,
@@ -371,27 +461,61 @@ def process_directory(
                 "reason": ref.reason,
             })
 
-        # Retry loop: if a previous run of this orchestrator already moved
-        # some files into processed/, the DB rows are already there for
-        # them — but only re-ingest files that still exist in the input
-        # folder. Re-grouping on each retry keeps the manifest in sync.
+        if metadata_errors:
+            summary.groups.append(GroupResult(
+                test_id=test_id, files=metadata,
+                manifest_path=None, status="skipped",
+                error="group held because metadata could not be read: "
+                      + "; ".join(metadata_errors),
+            ))
+            continue
+
+        existing_sources, existing_sequences = _existing_provenance(
+            db_path_str, test_id,
+        )
+        missing_sequences = _missing_chunk_sequences(
+            existing_sequences.union(ref.chunk_seq for ref in ready)
+        )
+        if missing_sequences:
+            missing_text = ", ".join(str(seq) for seq in missing_sequences)
+            error = f"missing chunk sequence(s): {missing_text}"
+            summary.failed_at_setup.append({
+                "test_id": test_id,
+                "filename": "",
+                "reason": error,
+            })
+            summary.groups.append(GroupResult(
+                test_id=test_id, files=metadata,
+                manifest_path=None, status="skipped", error=error,
+            ))
+            continue
+
+        # A source filename is the idempotency key within a logical run.
+        # Re-delivered files are archived again but their rows are not
+        # inserted a second time.
         to_ingest: list[ChunkRef] = [
-            ref for ref in ready if ref.path.exists()
+            ref for ref in ready
+            if ref.path.exists() and ref.path.name not in existing_sources
         ]
         bad_chunks: list[dict[str, Any]] = []
+        staged_db: Path | None = None
         if to_ingest:
             files_for_index = [str(r.path) for r in to_ingest]
             sequences = [r.chunk_seq for r in to_ingest]
             try:
+                staged_db = _staging_database(db_path_str)
                 ingest_result = indexer.parse_files(
                     files=files_for_index,
-                    db_path=db_path_str,
+                    db_path=str(staged_db),
                     config_path=config_path_str,
                     test_id=test_id,
                     dry_run=ingest_dry_run,
+                    chunk_sequences=sequences,
                 )
             except Exception as exc:  # noqa: BLE001 — orchestrator must
                 # report failures from the indexer rather than crash.
+                if staged_db is not None:
+                    staged_db.unlink(missing_ok=True)
                 _emit(
                     f"indexing failed for {test_id}: {type(exc).__name__}: {exc}"
                 )
@@ -423,26 +547,29 @@ def process_directory(
             # group is routed to failed/ when any chunk produces zero
             # records so downstream agents don't see partially-parsed
             # runs.
-            if not ingest_dry_run and Path(db_path_str).exists():
+            if not ingest_dry_run and staged_db is not None and staged_db.exists():
                 try:
-                    with sqlite3.connect(db_path_str) as conn:
+                    with sqlite3.connect(str(staged_db)) as conn:
                         cur = conn.cursor()
-                        per_chunk_counts: dict[int, int] = {}
-                        for source in ("events", "nas_events", "rf_kpis"):
+                        per_chunk_counts: dict[tuple[str, int], int] = {}
+                        for source in _PROVENANCE_TABLES:
                             for row in cur.execute(
-                                "SELECT chunk_seq, COUNT(*) FROM " + source +  # noqa: S608
-                                " WHERE test_id = ? GROUP BY chunk_seq",
+                                "SELECT source_file, chunk_seq, COUNT(*) FROM "
+                                + source  # noqa: S608 - fixed table names
+                                + " WHERE test_id = ? "
+                                  "GROUP BY source_file, chunk_seq",
                                 (test_id,),
                             ).fetchall():
-                                per_chunk_counts[row[0]] = (
-                                    per_chunk_counts.get(row[0], 0) + row[1]
+                                key = (str(row[0]), int(row[1]))
+                                per_chunk_counts[key] = (
+                                    per_chunk_counts.get(key, 0) + int(row[2])
                                 )
                         for ref in to_ingest:
-                            seq = ref.chunk_seq
-                            if per_chunk_counts.get(seq, 0) == 0:
+                            key = (ref.path.name, ref.chunk_seq)
+                            if per_chunk_counts.get(key, 0) == 0:
                                 bad_chunks.append({
                                     "filename": ref.path.name,
-                                    "chunk_seq": seq,
+                                    "chunk_seq": ref.chunk_seq,
                                     "reason": "no_records_indexed",
                                 })
                 except sqlite3.OperationalError:
@@ -469,6 +596,8 @@ def process_directory(
                 for ref in ready:
                     if ref.path.exists():
                         _safe_move(ref.path, failed_dir)
+                if staged_db is not None:
+                    staged_db.unlink(missing_ok=True)
                 summary.groups.append(GroupResult(
                     test_id=test_id,
                     files=metadata,
@@ -477,6 +606,16 @@ def process_directory(
                     error=err_msg,
                 ))
                 continue
+
+            # Publish only after every chunk passed validation.  Replacing a
+            # closed SQLite database is atomic, so readers see either the old
+            # complete state or the new complete state, never half a run.
+            if staged_db is not None and not bad_chunks:
+                if ingest_dry_run:
+                    staged_db.unlink(missing_ok=True)
+                else:
+                    os.replace(staged_db, db_path_str)
+                staged_db = None
         else:
             ingest_result = {
                 "totals": {"events": 0, "nas_events": 0, "rf_kpis": 0},
@@ -488,6 +627,8 @@ def process_directory(
         # quarantines the entire group — agents must never see a half-parsed
         # test run, only whole runs that all indexed cleanly.
         if bad_chunks:
+            if staged_db is not None:
+                staged_db.unlink(missing_ok=True)
             failed_dir = in_dir / failed_subdir / test_id
             failed_dir.mkdir(parents=True, exist_ok=True)
             err_lines = [
