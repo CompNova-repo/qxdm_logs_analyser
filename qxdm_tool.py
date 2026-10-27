@@ -148,18 +148,29 @@ def get_rf_summary(db_path: str, test_id: str | None = None) -> dict[str, Any]:
 
 
 def get_context_window(
-    db_path: str, timestamp: str, window_count: int = 5,
-    test_id: str | None = None,
+    db_path: str, timestamp: str | None, window_count: int = 5,
+    test_id: str | None = None, sequence: int | None = None,
 ) -> str:
-    """Retrieve raw signaling blocks before and after an event timestamp.
+    """Retrieve raw signaling blocks before and after an event.
 
-    Slices across chunk boundaries if ``test_id`` spans multiple files
+    Anchor on ``sequence`` (exact block, as returned by ``nas``, ``events`` and
+    ``anomalies``) or on ``timestamp`` (first indexed event at or before it).
+    Many blocks can share one millisecond, so ``sequence`` is the precise
+    anchor. Slices across chunk boundaries if ``test_id`` spans multiple files
     because the global ``sequence`` column already bridges chunk seams.
     """
+    if (timestamp is None) == (sequence is None):
+        raise ValueError("give exactly one of timestamp or --sequence")
     conn = connect(db_path)
     cur = conn.cursor()
-    clauses = ["timestamp <= ?"]
-    params: list[Any] = [timestamp]
+    if sequence is not None:
+        clauses = ["sequence = ?"]
+        params: list[Any] = [sequence]
+        order = "sequence ASC"
+    else:
+        clauses = ["timestamp <= ?"]
+        params = [timestamp]
+        order = "timestamp DESC, sequence ASC"
     if test_id:
         clauses.append("test_id = ?")
         params.append(test_id)
@@ -169,7 +180,7 @@ def get_context_window(
         SELECT sequence
         FROM events
         WHERE {where}
-        ORDER BY timestamp DESC, sequence ASC
+        ORDER BY {order}
         LIMIT 1
         """,
         params,
@@ -177,6 +188,8 @@ def get_context_window(
 
     if not target:
         conn.close()
+        if sequence is not None:
+            return f"No indexed event found at sequence: {sequence}"
         return f"No indexed event found at or before timestamp: {timestamp}"
 
     target_sequence = target[0]
@@ -259,7 +272,7 @@ def query_nas(
     if test_id:
         clauses.append("test_id = ?")
         params.append(test_id)
-    query = "SELECT timestamp, rat, msg_id, cause_code, cause_str, t3346_timer, t3502_timer, source_file FROM nas_events"
+    query = "SELECT timestamp, rat, msg_id, cause_code, cause_str, t3346_timer, t3502_timer, source_file, sequence FROM nas_events"
     if clauses:
         query += " WHERE " + " AND ".join(f"({c})" for c in clauses)
     query += " ORDER BY timestamp ASC, sequence ASC"
@@ -275,6 +288,7 @@ def query_nas(
             "t3346_timer": r[5],
             "t3502_timer": r[6],
             "source_file": r[7],
+            "sequence": r[8],
         }
         for r in rows
     ]
@@ -544,7 +558,7 @@ def unknown_types(db_path: str, limit: int = 20) -> dict[str, Any]:
     return envelope
 
 
-def parse_args() -> argparse.Namespace:
+def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Query a SQLite index produced by indexer.py."
     )
@@ -597,7 +611,14 @@ def parse_args() -> argparse.Namespace:
     window_parser = subparsers.add_parser(
         "window", help="Print raw indexed event blocks around a timestamp"
     )
-    window_parser.add_argument("timestamp", help='Example: "2024 Nov 1 11:17:29.011"')
+    window_parser.add_argument(
+        "timestamp", nargs="?", default=None,
+        help='Example: "2024 Nov 1 11:17:29.011". Omit when using --sequence.',
+    )
+    window_parser.add_argument(
+        "--sequence", type=int, default=None,
+        help="Anchor on this exact block sequence (from nas/events/anomalies output)",
+    )
     window_parser.add_argument(
         "-n",
         "--count",
@@ -661,56 +682,198 @@ def parse_args() -> argparse.Namespace:
         help="Maximum distinct unknown codes to print, default: 20",
     )
 
-    return parser.parse_args()
+    _add_results_commands(subparsers)
+    return parser
 
 
-def main() -> int:
-    args = parse_args()
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    return build_parser().parse_args(argv)
+
+
+#: Read-only evidence queries. Only these may be recorded as evidence by
+#: ``save-analysis``; everything else (including the results commands) is
+#: refused so evidence can never be produced by a write or by another DB.
+EVIDENCE_COMMANDS = frozenset({
+    "list-tests", "anomalies", "rf-summary", "nas", "window", "events",
+    "parser-health", "parser-failures", "parser-overlaps", "unknown-types",
+})
+
+#: Evidence commands that accept ``--test-id``. Evidence recorded for an
+#: analysis must be scoped to that analysis's test run.
+TEST_SCOPED_COMMANDS = frozenset({"anomalies", "rf-summary", "nas", "window", "events"})
+
+
+def _dispatch_query(args: argparse.Namespace) -> str:
+    """Run one evidence query and return exactly what the CLI would print."""
+    if args.command == "list-tests":
+        return json.dumps(list_tests(args.db), indent=2)
+    if args.command == "anomalies":
+        anomalies = query_anomalies(
+            args.db,
+            include_cause=getattr(args, "with_cause", False),
+            test_id=getattr(args, "test_id", None),
+        )
+        if getattr(args, "cause", None):
+            anomalies = [a for a in anomalies if a.get("releaseCause") == args.cause]
+        return json.dumps(anomalies, indent=2)
+    if args.command == "rf-summary":
+        return json.dumps(
+            get_rf_summary(args.db, test_id=getattr(args, "test_id", None)), indent=2,
+        )
+    if args.command == "nas":
+        return json.dumps(
+            query_nas(args.db, all_events=args.all, test_id=getattr(args, "test_id", None)),
+            indent=2,
+        )
+    if args.command == "window":
+        return get_context_window(
+            args.db, args.timestamp, args.count, test_id=getattr(args, "test_id", None),
+            sequence=args.sequence,
+        )
+    if args.command == "events":
+        return json.dumps(
+            list_events(args.db, args.limit, test_id=getattr(args, "test_id", None)),
+            indent=2,
+        )
+    if args.command == "parser-health":
+        return json.dumps(parser_health(args.db), indent=2)
+    if args.command == "parser-failures":
+        return json.dumps(parser_failures(args.db, args.parser_name, args.limit), indent=2)
+    if args.command == "parser-overlaps":
+        return json.dumps(parser_overlaps(args.db, args.limit), indent=2)
+    if args.command == "unknown-types":
+        return json.dumps(unknown_types(args.db, args.limit), indent=2)
+    raise ValueError(f"not an evidence query: {args.command}")
+
+
+def run_query(db_path: str, argv: list[str]) -> str:
+    """Run an evidence query given as CLI arguments, against ``db_path``.
+
+    Used by ``save-analysis`` to capture evidence itself. ``argv`` is the part
+    after ``qxdm_tool.py`` (e.g. ``["nas", "--test-id", "UE23"]``). It must not
+    contain ``--db``: the evidence DB is fixed by the caller.
+    """
+    if not argv or not all(isinstance(a, str) for a in argv):
+        raise ValueError("evidence command must be a non-empty list of strings")
+    if argv[0] not in EVIDENCE_COMMANDS:
+        raise ValueError(f"{argv[0]!r} is not an allowed evidence query")
+    if any(a == "--db" or a.startswith("--db=") for a in argv):
+        raise ValueError("evidence commands may not override --db")
+    parser = build_parser()
+    parser.exit_on_error = False
     try:
-        if args.command == "list-tests":
-            print(json.dumps(list_tests(args.db), indent=2))
-        elif args.command == "anomalies":
-            anomalies = query_anomalies(
-                args.db,
-                include_cause=getattr(args, "with_cause", False),
-                test_id=getattr(args, "test_id", None),
-            )
-            # Optional cause filtering
-            if getattr(args, "cause", None):
-                anomalies = [a for a in anomalies if a.get("releaseCause") == args.cause]
-            print(json.dumps(anomalies, indent=2))
-        elif args.command == "rf-summary":
-            print(json.dumps(
-                get_rf_summary(args.db, test_id=getattr(args, "test_id", None)),
-                indent=2,
-            ))
-        elif args.command == "nas":
-            print(json.dumps(
-                query_nas(args.db, all_events=args.all, test_id=getattr(args, "test_id", None)),
-                indent=2,
-            ))
-        elif args.command == "window":
-            print(get_context_window(
-                args.db, args.timestamp, args.count,
-                test_id=getattr(args, "test_id", None),
-            ))
-        elif args.command == "events":
-            print(json.dumps(
-                list_events(args.db, args.limit, test_id=getattr(args, "test_id", None)),
-                indent=2,
-            ))
-        elif args.command == "parser-health":
-            print(json.dumps(parser_health(args.db), indent=2))
-        elif args.command == "parser-failures":
-            print(json.dumps(
-                parser_failures(args.db, args.parser_name, args.limit),
-                indent=2,
-            ))
-        elif args.command == "parser-overlaps":
-            print(json.dumps(parser_overlaps(args.db, args.limit), indent=2))
-        elif args.command == "unknown-types":
-            print(json.dumps(unknown_types(args.db, args.limit), indent=2))
+        args = parser.parse_args(["--db", db_path, *argv])
+    except (argparse.ArgumentError, SystemExit) as exc:
+        raise ValueError(f"invalid evidence command {argv!r}: {exc}") from None
+    return _dispatch_query(args)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        if args.command in EVIDENCE_COMMANDS:
+            print(_dispatch_query(args))
+        else:
+            return _run_results_command(args)
         return 0
+    except (FileNotFoundError, sqlite3.Error, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 1
+
+
+# ---------------------------------------------------------------------------
+# Results DB commands (stored analyses, findings and evidence)
+# ---------------------------------------------------------------------------
+
+
+def _add_results_commands(subparsers: Any) -> None:
+    def results_db_arg(p: argparse.ArgumentParser) -> None:
+        p.add_argument(
+            "--results-db", default="qxdm_results.db",
+            help="Results DB path, default: qxdm_results.db",
+        )
+
+    p = subparsers.add_parser(
+        "save-analysis",
+        help="Validate an analysis JSON, capture its evidence from --db, and store it",
+    )
+    results_db_arg(p)
+    p.add_argument("analysis_file", help="Path to the analysis JSON (see docs/RESULTS_DB.md)")
+    p.add_argument(
+        "--allow-ungrounded", action="store_true",
+        help="Store findings that only have note evidence (they are flagged ungrounded)",
+    )
+    p.add_argument("--parser-config", default=None, help="parser_config.json used to build --db")
+    p.add_argument("--indexer-commit", default=None, help="Git commit of the indexer used to build --db")
+
+    p = subparsers.add_parser("list-analyses", help="List stored analyses")
+    results_db_arg(p)
+    p.add_argument("--test-id", dest="test_id", default=None)
+    p.add_argument("--status", default=None)
+
+    p = subparsers.add_parser("show-analysis", help="Show one stored analysis with findings and evidence")
+    results_db_arg(p)
+    p.add_argument("analysis_id")
+    p.add_argument("--markdown", action="store_true", help="Print only the stored markdown report")
+
+    p = subparsers.add_parser("review-analysis", help="Record a human review decision")
+    results_db_arg(p)
+    p.add_argument("analysis_id")
+    p.add_argument("--status", required=True, help="reviewed | accepted | rejected | superseded")
+    p.add_argument("--reviewer", required=True)
+    p.add_argument("--note", default="")
+
+    p = subparsers.add_parser("findings", help="List stored findings across analyses")
+    results_db_arg(p)
+    p.add_argument("--test-id", dest="test_id", default=None)
+    p.add_argument("--status", default=None)
+    p.add_argument("--layer", default=None)
+    p.add_argument("--code", default=None)
+
+    p = subparsers.add_parser("set-finding-status", help="Update a finding's status")
+    results_db_arg(p)
+    p.add_argument("finding_id", type=int)
+    p.add_argument("--status", required=True, help="open | fixed | false_positive | wont_fix")
+
+
+def _run_results_command(args: argparse.Namespace) -> int:
+    import results_db
+
+    try:
+        if args.command == "save-analysis":
+            payload = json.loads(Path(args.analysis_file).read_text(encoding="utf-8"))
+            analysis_id = results_db.save_analysis(
+                args.results_db, args.db, payload,
+                base_dir=Path(args.analysis_file).resolve().parent,
+                allow_ungrounded=args.allow_ungrounded,
+                parser_config=args.parser_config,
+                indexer_commit=args.indexer_commit,
+            )
+            print(json.dumps({"analysis_id": analysis_id}, indent=2))
+        elif args.command == "list-analyses":
+            print(json.dumps(results_db.list_analyses(
+                args.results_db, test_id=args.test_id, status=args.status), indent=2))
+        elif args.command == "show-analysis":
+            analysis = results_db.get_analysis(args.results_db, args.analysis_id)
+            print(analysis["report_markdown"] if args.markdown else json.dumps(analysis, indent=2))
+        elif args.command == "review-analysis":
+            results_db.review_analysis(
+                args.results_db, args.analysis_id, args.status, args.reviewer, args.note)
+            print(json.dumps(results_db.get_analysis(args.results_db, args.analysis_id)["review"], indent=2))
+        elif args.command == "findings":
+            print(json.dumps(results_db.list_findings(
+                args.results_db, test_id=args.test_id, status=args.status,
+                layer=args.layer, code=args.code), indent=2))
+        elif args.command == "set-finding-status":
+            results_db.set_finding_status(args.results_db, args.finding_id, args.status)
+            print(json.dumps({"finding_id": args.finding_id, "status": args.status}, indent=2))
+        return 0
+    except results_db.AnalysisRejected as exc:
+        print(json.dumps({"rejected": True, "errors": exc.errors}, indent=2), file=sys.stderr)
+        return 2
+    except (KeyError, ValueError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return 2
     except (FileNotFoundError, sqlite3.Error) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
