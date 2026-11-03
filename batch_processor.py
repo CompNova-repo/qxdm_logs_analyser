@@ -227,6 +227,84 @@ def _safe_move(src: Path, dst_dir: Path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# Run-integrity helpers
+# ---------------------------------------------------------------------------
+
+#: Tables whose rows carry ``test_id`` / ``source_file`` provenance.
+PROVENANCE_TABLES = ("events", "nas_events", "rf_kpis")
+
+
+def _purge_rows(db_path: str | Path, test_id: str, filenames: list[str]) -> int:
+    """Delete rows written for ``filenames`` under ``test_id``.
+
+    Called whenever an ingest attempt does not end in ``processed`` so the
+    agent can never query a half-indexed run. Rows from chunks of the same
+    run that were processed in an earlier cycle are left alone.
+    """
+    if not filenames or not Path(db_path).exists():
+        return 0
+    placeholders = ",".join("?" * len(filenames))
+    removed = 0
+    with sqlite3.connect(str(db_path)) as conn:
+        for table in PROVENANCE_TABLES:
+            try:
+                cur = conn.execute(
+                    f"DELETE FROM {table} WHERE test_id = ? "  # noqa: S608
+                    f"AND source_file IN ({placeholders})",
+                    (test_id, *filenames),
+                )
+                removed += cur.rowcount
+            except sqlite3.OperationalError:
+                # Pre-multifile DB without provenance columns.
+                pass
+    return removed
+
+
+def _load_manifest(path: Path) -> dict[str, Any] | None:
+    """Return a previously written ``manifest.json`` or ``None``."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def _missing_sequences(seqs: Iterable[int]) -> list[int]:
+    """Chunk numbers absent from an otherwise contiguous run.
+
+    Runs may be numbered from 0 or from 1; anything between the start and
+    the highest chunk seen that is not present counts as missing. A missing
+    *final* chunk cannot be detected here (that needs an expected count).
+    """
+    present = set(seqs)
+    if not present:
+        return []
+    start = 0 if 0 in present else 1
+    return [s for s in range(start, max(present) + 1) if s not in present]
+
+
+def _quarantine(
+    in_dir: Path,
+    failed_subdir: str,
+    test_id: str,
+    refs: Iterable["ChunkRef"],
+    reason_lines: list[str],
+) -> None:
+    """Move ``refs`` to ``failed/<test_id>/`` and write ``error.txt``."""
+    failed_dir = in_dir / failed_subdir / test_id
+    failed_dir.mkdir(parents=True, exist_ok=True)
+    header = [
+        f"test_id={test_id}",
+        f"timestamp={_dt.datetime.now(tz=_dt.timezone.utc).isoformat()}",
+    ]
+    (failed_dir / "error.txt").write_text(
+        "\n".join(header + reason_lines) + "\n", encoding="utf-8"
+    )
+    for ref in refs:
+        if ref.path.exists():
+            _safe_move(ref.path, failed_dir)
+
+
+# ---------------------------------------------------------------------------
 # Result types
 # ---------------------------------------------------------------------------
 
@@ -236,7 +314,11 @@ class GroupResult:
     test_id: str
     files: list[dict[str, Any]]
     manifest_path: Path | None
-    status: str  # "processed" | "failed" | "skipped"
+    # "processed" | "failed" | "skipped"
+    # | "waiting"    (a chunk is still being written; retry next cycle)
+    # | "incomplete" (a chunk number is missing; wait for it)
+    # | "duplicate"  (every file was already ingested with identical content)
+    status: str
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
@@ -323,22 +405,33 @@ def process_directory(
 
         # Stability check + hashing
         ready: list[ChunkRef] = []
+        not_ready: list[str] = []
         for ref in refs:
             if not ref.path.is_file():
-                summary.failed_at_setup.append({
-                    "test_id": test_id,
-                    "filename": ref.path.name,
-                    "reason": "missing",
-                })
+                reason = "missing"
+            elif not _wait_for_size_stability(ref.path, stability_window, max_wait):
+                reason = "size_unstable"
+            else:
+                ready.append(ref)
                 continue
-            if not _wait_for_size_stability(ref.path, stability_window, max_wait):
-                summary.failed_at_setup.append({
-                    "test_id": test_id,
-                    "filename": ref.path.name,
-                    "reason": "size_unstable",
-                })
-                continue
-            ready.append(ref)
+            not_ready.append(f"{ref.path.name} ({reason})")
+            summary.failed_at_setup.append({
+                "test_id": test_id,
+                "filename": ref.path.name,
+                "reason": reason,
+            })
+
+        # One unfinished chunk holds the whole run. Indexing the rest would
+        # either produce a run with a hole in it or quarantine files that
+        # are fine; waiting for the next cycle avoids both.
+        if not_ready:
+            _emit(f"holding {test_id}: not ready: {', '.join(not_ready)}")
+            summary.groups.append(GroupResult(
+                test_id=test_id, files=[], manifest_path=None,
+                status="waiting",
+                error=f"chunk(s) still being written: {', '.join(not_ready)}",
+            ))
+            continue
 
         if not ready:
             summary.groups.append(GroupResult(
@@ -371,6 +464,97 @@ def process_directory(
                 "reason": ref.reason,
             })
 
+        # ------------------------------------------------------------------
+        # Run-integrity checks against what was already ingested for this
+        # test_id in an earlier cycle (recorded in processed/<id>/manifest).
+        # ------------------------------------------------------------------
+        processed_dir = in_dir / processed_subdir / test_id
+        prior_manifest = _load_manifest(processed_dir / "manifest.json") or {}
+        prior_chunks: dict[str, dict[str, Any]] = {
+            c["filename"]: c for c in prior_manifest.get("chunks", [])
+            if isinstance(c, dict) and "filename" in c
+        }
+        sha_by_name = {m["filename"]: m["sha256"] for m in metadata}
+
+        # (a) Re-delivered files: identical content is skipped, different
+        #     content under the same name needs a human decision.
+        duplicates: list[ChunkRef] = []
+        conflicts: list[str] = []
+        for ref in ready:
+            prev = prior_chunks.get(ref.path.name)
+            if prev is None:
+                continue
+            if prev.get("sha256") and prev["sha256"] == sha_by_name.get(ref.path.name):
+                duplicates.append(ref)
+            else:
+                conflicts.append(ref.path.name)
+        if conflicts:
+            msg = (
+                "re-delivered with different content than the copy already "
+                f"indexed: {', '.join(conflicts)}"
+            )
+            _emit(f"{test_id}: {msg}")
+            _quarantine(in_dir, failed_subdir, test_id, ready, [msg])
+            summary.groups.append(GroupResult(
+                test_id=test_id, files=[], manifest_path=None,
+                status="failed", error=msg,
+            ))
+            continue
+        for ref in duplicates:
+            _emit(f"{test_id}: {ref.path.name} already indexed (same SHA-256), skipping")
+            _safe_move(ref.path, processed_dir / "duplicates")
+        if duplicates:
+            dup_names = {r.path.name for r in duplicates}
+            ready = [r for r in ready if r.path.name not in dup_names]
+            metadata = [m for m in metadata if m["filename"] not in dup_names]
+            if not ready:
+                summary.groups.append(GroupResult(
+                    test_id=test_id, files=[], manifest_path=None,
+                    status="duplicate",
+                    error="all files were already indexed with identical content",
+                ))
+                continue
+
+        # (b) Two different files claiming the same chunk number.
+        prior_seq_owner = {
+            c.get("chunk_seq"): name for name, c in prior_chunks.items()
+        }
+        seen: dict[int, str] = {}
+        clashes: list[str] = []
+        for ref in ready:
+            other = seen.get(ref.chunk_seq) or prior_seq_owner.get(ref.chunk_seq)
+            if other and other != ref.path.name:
+                clashes.append(f"{ref.path.name} and {other} are both chunk {ref.chunk_seq}")
+            seen[ref.chunk_seq] = ref.path.name
+        if clashes:
+            msg = "duplicate chunk numbers: " + "; ".join(clashes)
+            _emit(f"{test_id}: {msg}")
+            _quarantine(in_dir, failed_subdir, test_id, ready, [msg])
+            summary.groups.append(GroupResult(
+                test_id=test_id, files=[], manifest_path=None,
+                status="failed", error=msg,
+            ))
+            continue
+
+        # (c) Gaps. Files stay in the input folder so the run completes on
+        #     its own once the missing chunk lands.
+        all_seqs = {r.chunk_seq for r in ready} | {
+            int(c["chunk_seq"]) for c in prior_chunks.values()
+            if isinstance(c.get("chunk_seq"), int)
+        }
+        missing = _missing_sequences(all_seqs)
+        if missing:
+            msg = (
+                f"missing chunk(s) {', '.join(map(str, missing))}; "
+                "waiting for them before indexing"
+            )
+            _emit(f"{test_id}: {msg}")
+            summary.groups.append(GroupResult(
+                test_id=test_id, files=metadata, manifest_path=None,
+                status="incomplete", error=msg,
+            ))
+            continue
+
         # Retry loop: if a previous run of this orchestrator already moved
         # some files into processed/, the DB rows are already there for
         # them — but only re-ingest files that still exist in the input
@@ -389,12 +573,16 @@ def process_directory(
                     config_path=config_path_str,
                     test_id=test_id,
                     dry_run=ingest_dry_run,
+                    # Keep the real chunk numbers from the filenames; without
+                    # this the indexer renumbers 1..N and gaps disappear.
+                    chunk_sequences=sequences,
                 )
             except Exception as exc:  # noqa: BLE001 — orchestrator must
                 # report failures from the indexer rather than crash.
                 _emit(
                     f"indexing failed for {test_id}: {type(exc).__name__}: {exc}"
                 )
+                _purge_rows(db_path_str, test_id, [r.path.name for r in to_ingest])
                 failed_dir = in_dir / failed_subdir / test_id
                 failed_dir.mkdir(parents=True, exist_ok=True)
                 err_path = failed_dir / "error.txt"
@@ -461,6 +649,7 @@ def process_directory(
                     f"{test_id} — likely parse regression"
                 )
                 _emit(err_msg)
+                _purge_rows(db_path_str, test_id, [r.path.name for r in to_ingest])
                 failed_dir = in_dir / failed_subdir / test_id
                 failed_dir.mkdir(parents=True, exist_ok=True)
                 (failed_dir / "error.txt").write_text(
@@ -488,6 +677,9 @@ def process_directory(
         # quarantines the entire group — agents must never see a half-parsed
         # test run, only whole runs that all indexed cleanly.
         if bad_chunks:
+            # Remove rows the good chunks already committed, otherwise the
+            # agent can still query a run that was quarantined.
+            _purge_rows(db_path_str, test_id, [r.path.name for r in to_ingest])
             failed_dir = in_dir / failed_subdir / test_id
             failed_dir.mkdir(parents=True, exist_ok=True)
             err_lines = [
@@ -516,7 +708,6 @@ def process_directory(
             continue
 
         # Move all ready files into processed/<test_id>/
-        processed_dir = in_dir / processed_subdir / test_id
         processed_dir.mkdir(parents=True, exist_ok=True)
         moved: list[dict[str, Any]] = []
         for meta in metadata:
@@ -535,13 +726,33 @@ def process_directory(
             moved.append({**meta, "moved_to": str(dst)})
 
         manifest_path = processed_dir / "manifest.json"
+        # Merge with chunks ingested in earlier cycles (late arrivals) so
+        # the manifest always describes the whole run, not the last batch.
+        new_names = {m["filename"] for m in moved}
+        all_chunks = [
+            c for name, c in prior_chunks.items() if name not in new_names
+        ] + moved
+        all_chunks.sort(key=lambda c: (c.get("chunk_seq", 0), c.get("filename", "")))
+        totals: dict[str, Any] = dict(ingest_result.get("totals", {}))
+        if not ingest_dry_run and Path(db_path_str).exists():
+            try:
+                with sqlite3.connect(db_path_str) as conn:
+                    totals.update({
+                        t: conn.execute(
+                            f"SELECT COUNT(*) FROM {t} WHERE test_id = ?",  # noqa: S608
+                            (test_id,),
+                        ).fetchone()[0]
+                        for t in PROVENANCE_TABLES
+                    })
+            except sqlite3.OperationalError:
+                pass
         manifest_payload = {
             "test_id": test_id,
             "ingested_at": _dt.datetime.now(tz=_dt.timezone.utc).isoformat(),
-            "chunks": moved,
+            "chunks": all_chunks,
             "totals": {
-                "files": len(moved),
-                **ingest_result.get("totals", {}),
+                "files": len(all_chunks),
+                **totals,
             },
         }
         try:

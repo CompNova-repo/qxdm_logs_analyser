@@ -1,0 +1,129 @@
+{
+  "test_id": "UE23",
+  "title": "UE23 recurring 5G registration rejection loop",
+  "verdict": "Network-side defects: 5G core omits T3346 on cause #22 (primary), LTE redirect points to an unconfigured NR carrier (secondary). RF excluded.",
+  "severity": "P1",
+  "primary_owner": "Core / AMF",
+  "summary": "20 of 20 mobility registration updates rejected with cause #22 and no T3346, looping every 57.6 s for 1,095 s with good RF. Each cycle starts from an LTE redirect to NR-ARFCN 435000, which matches none of the NR carriers the LTE network configures.",
+  "report_file": "report.md",
+  "agent": {
+    "name": "manual review (Claude)",
+    "model": "claude-opus-5-5",
+    "prompt_version": "results-db-v1"
+  },
+  "findings": [
+    {
+      "code": "RF-OK",
+      "title": "Radio conditions are good throughout",
+      "layer": "rf",
+      "statement": "Average RSRP -84.03 dBm, minimum SNR 23.2 dB and average RSRQ -8.86 dB across 404 samples. RF does not explain the failures.",
+      "confidence": "high",
+      "evidence": [
+        {
+          "kind": "query",
+          "command": ["rf-summary", "--test-id", "UE23"],
+          "quote": ["\"records\": 404", "\"avg_rsrp_dbm\": -84.03", "\"min_snr_db\": 23.2", "\"avg_rsrq_db\": -8.86"]
+        }
+      ]
+    },
+    {
+      "code": "DEF-1",
+      "title": "Registration Reject cause #22 sent without T3346",
+      "layer": "core",
+      "statement": "All 20 registration attempts are rejected with 5GMM cause #22 Congestion and no T3346 back-off timer; T3502 = 720 s is included. With no congestion back-off the UE retries every 57.6 s on average.",
+      "spec_reference": "3GPP TS 24.501 §5.5.1.3.5",
+      "confidence": "high",
+      "evidence": [
+        {
+          "kind": "query",
+          "command": ["nas", "--test-id", "UE23"],
+          "quote": ["\"cause_code\": 22", "\"t3346_timer\": null", "\"t3502_timer\": 720"]
+        },
+        {
+          "kind": "query",
+          "command": ["window", "--sequence", "1590", "-n", "0", "--test-id", "UE23"],
+          "quote": ["_5gmm_cause = 22 (0x16) (Congestion)", "t3346_incl = 0 (0x0)", "timer_2_value = 12 (0xc)"]
+        },
+        {
+          "kind": "note",
+          "note": "All 20 Registration Requests carry _5gs_reg_type = 2 (mob reg updating), so the mobility registration clause applies. 0xB80B is not indexed, so this is from the raw log.",
+          "source": "raw log, UE23_TCP_UDP_UL_75_01-11_06-36-49-875.txt, first request at line 14890"
+        }
+      ],
+      "recommendations": [
+        {"action": "Include T3346 in Registration Reject when rejecting with cause #22", "owner": "Core / AMF", "priority": "p1"}
+      ]
+    },
+    {
+      "code": "DEF-2",
+      "title": "LTE to NR redirect targets an unconfigured NR carrier",
+      "layer": "ran",
+      "statement": "All 20 RRCConnectionRelease redirects point to NR-ARFCN 435000 (2175.000 MHz). The LTE measurement configuration lists 632448, 434890, 434910, 126490 and 639168, not 435000. 2175.000 MHz is not on the NR sync raster, while 434890 and 434910 are, which suggests a mistyped redirect target.",
+      "spec_reference": "3GPP TS 36.331 CarrierInfoNR-r15; TS 38.104 §5.4.3",
+      "confidence": "medium",
+      "evidence": [
+        {
+          "kind": "query",
+          "command": ["anomalies", "--with-cause", "--test-id", "UE23"],
+          "quote": ["redirectedCarrierInfo nr-r15", "carrierFreq-r15 435000"]
+        },
+        {
+          "kind": "query",
+          "command": ["window", "--sequence", "4728", "-n", "0", "--test-id", "UE23"],
+          "quote": ["carrierFreq-r15 434890", "carrierFreq-r15 434910", "carrierFreq-r15 126490", "carrierFreq-r15 632448", "carrierFreq-r15 639168"]
+        }
+      ],
+      "recommendations": [
+        {"action": "Correct redirectedCarrierInfo to the intended NR carrier (434890 or 434910 for n66, or 126490) or remove the redirect", "owner": "RAN", "priority": "p2"}
+      ]
+    },
+    {
+      "code": "OBS-T3502",
+      "title": "T3502 back-off never takes effect",
+      "layer": "device",
+      "statement": "T3502 (720 s) should apply after five failed attempts, but the largest gap between rejects is 137.5 s. Likely the successful LTE tracking area update in each cycle resets the registration attempt counter. Hypothesis, needs confirming.",
+      "spec_reference": "3GPP TS 24.501 §5.5.1.3.7",
+      "confidence": "low",
+      "evidence": [
+        {
+          "kind": "query",
+          "command": ["nas", "--test-id", "UE23"],
+          "quote": ["2023 Jan 11  11:17:29.602", "2023 Jan 11  11:35:44.645"]
+        }
+      ],
+      "recommendations": [
+        {"action": "Confirm attempt-counter reset behaviour with the UE vendor or a controlled test", "owner": "Device / Core", "priority": "p3"}
+      ]
+    },
+    {
+      "code": "TOOL-1",
+      "title": "LTE EMM and NR registration request messages are not indexed",
+      "layer": "tooling",
+      "statement": "0xB0ED (TAU request), 0xB0EC (TAU accept) and 0xB80B (Registration request) are unclaimed by any parser, so their counts and fields (such as registration type) cannot be queried and had to come from the raw log.",
+      "confidence": "high",
+      "evidence": [
+        {
+          "kind": "query",
+          "command": ["unknown-types", "--limit", "50"],
+          "quote": ["\"msg_code\": \"0XB0ED\"", "\"msg_code\": \"0XB0EC\"", "\"msg_code\": \"0XB80B\""]
+        }
+      ],
+      "recommendations": [
+        {"action": "Add parsers for LTE EMM OTA and NR registration request messages", "owner": "Tooling", "priority": "p3"}
+      ]
+    }
+  ],
+  "metrics": [
+    {"name": "registration_rejects", "value": 20, "unit": "count"},
+    {"name": "rejects_with_t3346", "value": 0, "unit": "count"},
+    {"name": "t3502", "value": 720, "unit": "s"},
+    {"name": "reject_gap_mean", "value": 57.6, "unit": "s"},
+    {"name": "reject_gap_min", "value": 23.4, "unit": "s"},
+    {"name": "reject_gap_max", "value": 137.5, "unit": "s"},
+    {"name": "reject_loop_span", "value": 1095.0, "unit": "s"},
+    {"name": "avg_rsrp", "value": -84.03, "unit": "dBm"},
+    {"name": "avg_rsrq", "value": -8.86, "unit": "dB"},
+    {"name": "min_snr", "value": 23.2, "unit": "dB"},
+    {"name": "redirects_to_435000", "value": 20, "unit": "count"}
+  ]
+}
